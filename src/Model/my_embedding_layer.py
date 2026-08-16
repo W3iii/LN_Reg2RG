@@ -179,10 +179,14 @@ class MyEmbedding(nn.Module):
         for key in region_embeddings.keys():
             region_embeddings[key] = torch.cat([region_embeddings[key], mask_embeddings[key].unsqueeze(1)], dim=1) 
         
-        max_region = len(region_embeddings)  
+        max_region = len(region_embeddings)
         # zero init the vision embedding
+        # NOTE: dtype must follow the module, not torch's fp32 default. Otherwise
+        # this buffer is fp32 while self.weight is bf16, and the torch.cat below
+        # promotes the whole embedding table back to fp32 mid-graph.
         vision_region_embedding = torch.zeros(
-            (B, 33*max_region, self.embedding_dim), device=text_input.device) # NOTE: 2 means 1 region and 1 mask embeddings
+            (B, 33*max_region, self.embedding_dim),
+            device=text_input.device, dtype=self.weight.dtype) # NOTE: 2 means 1 region and 1 mask embeddings
         
         for i in range(B):
             for j in range(len(region2areas[i])):

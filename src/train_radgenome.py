@@ -28,8 +28,13 @@ class DataCollator(object):
         vision_temp = {area: [] for area in REGIONS}
         mask_temp = {area: [] for area in REGIONS}
         # get the shape of the vision tensor
-        vision_shape = next(iter(vision_xs[0].values())).shape
-        mask_shape = next(iter(mask_xs[0].values())).shape
+        # NOTE: carry the dtype too — the padding below must match the real
+        # tensors, or absent regions arrive at a different precision than present
+        # ones within the same batch.
+        vision_ref = next(iter(vision_xs[0].values()))
+        mask_ref = next(iter(mask_xs[0].values()))
+        vision_shape, vision_dtype = vision_ref.shape, vision_ref.dtype
+        mask_shape, mask_dtype = mask_ref.shape, mask_ref.dtype
 
         useless_regions = []
         
@@ -41,8 +46,8 @@ class DataCollator(object):
                     mask_temp[area].append(mask_xs[i][area])
                     flag = True
                 else:
-                    vision_temp[area].append(torch.zeros(vision_shape))
-                    mask_temp[area].append(torch.zeros(mask_shape))
+                    vision_temp[area].append(torch.zeros(vision_shape, dtype=vision_dtype))
+                    mask_temp[area].append(torch.zeros(mask_shape, dtype=mask_dtype))
             if not flag:
                 useless_regions.append(area)
 

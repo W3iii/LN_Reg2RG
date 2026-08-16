@@ -58,7 +58,15 @@ class Reg2RG(nn.Module):
         self.lang_model = LlamaForCausalLM.from_pretrained(
             lang_model_path,
         )
-        self.lang_model = self.lang_model.half()
+        # NOTE: upstream hardcoded .half() and let DeepSpeed reconcile precision
+        # (ds_configs/stage2.json sets "bf16": {"enabled": "auto"}). Running
+        # without DeepSpeed, fp16 weights under HF Trainer's bf16 autocast give
+        # NaN losses from the first step. Match the model dtype to the autocast
+        # mode instead: bf16 on Ampere+, fp16 as a fallback.
+        self.model_dtype = torch.bfloat16 if (
+            torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        ) else torch.float16
+        self.lang_model = self.lang_model.to(self.model_dtype)
         # # load partial weights from llava-med
         # lang_ckpt = torch.load(
         #     '/jhcnas1/chenzhixuan/checkpoints/LLM4CTRG/llava_partial_weights.pth', map_location='cpu')
@@ -80,6 +88,10 @@ class Reg2RG(nn.Module):
         #     param.requires_grad = False
 
         self.embedding_layer = MyEmbedding(pretrained_visual_encoder, pretrained_adapter)
+        # The vision encoder loads in fp32; cast before tying the word embedding so
+        # the whole input-embedding path is one dtype (the tie shares a Parameter
+        # object, so casting after would silently re-cast the LLM's embedding too).
+        self.embedding_layer = self.embedding_layer.to(self.model_dtype)
         self.embedding_layer.weight = self.lang_model.get_input_embeddings().weight
         self.loss_function = nn.CrossEntropyLoss()
 
