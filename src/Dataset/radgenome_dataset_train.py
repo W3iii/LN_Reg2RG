@@ -37,21 +37,18 @@ CONDITIONS = [
     'Interlobular septal thickening',
 ]
 
+# NOTE: 5 pulmonary lobes (NCKU ME dataset). Names must match the mask filenames
+# under <mask_folder>/seg_<volume_name>/<region>.nii.gz exactly.
 REGIONS = [
-    'abdomen',
-    'bone',
-    'breast',
-    'esophagus',
-    'heart',
-    'lung',
-    'mediastinum',
-    'pleura',
-    'thyroid',
-    'trachea and bronchie',
+    'right upper lobe',
+    'right middle lobe',
+    'right lower lobe',
+    'left upper lobe',
+    'left lower lobe',
 ]
-    
+
 class RadGenomeDataset_Train(PersistentDataset):
-    def __init__(self, text_tokenizer, data_folder, mask_folder, csv_file, cache_dir, max_region_size=10, max_img_size = 1, image_num = 32, region_num=33, max_seq=2048, resize_dim=500, voc_size=32000, force_num_frames=True):
+    def __init__(self, text_tokenizer, data_folder, mask_folder, csv_file, cache_dir, max_region_size=5, max_img_size = 1, image_num = 32, region_num=33, max_seq=2048, resize_dim=500, voc_size=32000, force_num_frames=True):
         # text_tokenizer
         self.text_tokenizer = AutoTokenizer.from_pretrained(
                 text_tokenizer,
@@ -97,6 +94,7 @@ class RadGenomeDataset_Train(PersistentDataset):
         self.data_folder = data_folder
         self.mask_folder = mask_folder
 
+        self.csv_file = csv_file
         self.accession_to_sentences = self.load_accession_sentences(csv_file)
         self.paths=[]
         self.samples = self.prepare_samples()
@@ -143,7 +141,10 @@ class RadGenomeDataset_Train(PersistentDataset):
         
         # 获取当前文件的绝对路径
         current_file_dir = os.path.dirname(os.path.abspath(__file__))
-        cache_file = os.path.join(current_file_dir, 'train_samples.pkl')
+        # NOTE: cache name is derived from the report CSV so that train/val/test
+        # (and different datasets) never silently reuse each other's sample list.
+        csv_tag = os.path.splitext(os.path.basename(self.csv_file))[0]
+        cache_file = os.path.join(current_file_dir, f'samples_{csv_tag}.pkl')
 
         if os.path.exists(cache_file):
             samples = pickle.load(open(cache_file, 'rb'))

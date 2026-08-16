@@ -172,3 +172,14 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# RadGenome sample cache (regenerated per report CSV)
+src/Dataset/samples_*.pkl
+train_samples.pkl
+scripts/wandb/
+
+# pretrained weights (~14.6 GB) — download, never commit
+pretrain/
+
+# training outputs
+outputs/
