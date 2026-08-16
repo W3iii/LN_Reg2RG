@@ -31,7 +31,14 @@ monai_cache_dir="$DATA_ROOT/cache" # useless
 
 # Outputs — inside the project directory
 output_dir="$REPO_ROOT/outputs/$experiment_name"
-deepspeed_config="$REPO_ROOT/ds_configs/stage2.json"
+
+# DeepSpeed — empty means "don't use it".
+# On a single 80 GB A100 with LoRA, ZeRO-2 mainly shards optimizer state, which
+# is already tiny here, so it is not worth the version friction: deepspeed
+# 0.12.6 fails to import against torch >= 2.4. Set this to
+# "$REPO_ROOT/ds_configs/stage2.json" only when going multi-GPU, and then pin a
+# deepspeed release that matches your torch (>= 0.15 for torch >= 2.4).
+deepspeed_config=""
 
 # Training settings
 # NOTE: only 1116 training patients (RadGenome has ~20k), so 10 epochs will very

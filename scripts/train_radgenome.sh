@@ -19,8 +19,21 @@ source "../configs/${script_name}/${config_file}.sh"
 # 根据 cuda_devices 设置的GPU数量自动设置 nproc_per_node
 nproc_per_node=$(echo $cuda_devices | tr ',' '\n' | wc -l)
 
+# DeepSpeed is optional: leave deepspeed_config empty in the config to skip it.
+# With LoRA the optimizer state is small, so ZeRO-2 buys little on a single GPU,
+# and deepspeed 0.12.6 does not import against torch >= 2.4
+# (elastic_agent.py imports `log`, renamed to `logger` upstream).
+ds_args=()
+if [ -n "${deepspeed_config:-}" ]; then
+    ds_args+=(--deepspeed "$deepspeed_config")
+    echo "[train] DeepSpeed enabled: $deepspeed_config"
+else
+    echo "[train] DeepSpeed disabled (deepspeed_config is empty)"
+fi
+
 # 使用配置参数执行训练
 CUDA_VISIBLE_DEVICES=$cuda_devices torchrun --nproc_per_node=$nproc_per_node --master-port=$master_port  ../src/${script_name}.py \
+    "${ds_args[@]}" \
     --bf16 $bf16 \
     --lang_encoder_path "$lang_encoder_path" \
     --tokenizer_path "$tokenizer_path" \
@@ -31,7 +44,6 @@ CUDA_VISIBLE_DEVICES=$cuda_devices torchrun --nproc_per_node=$nproc_per_node --m
     --report_file "$report_file" \
     --monai_cache_dir "$monai_cache_dir" \
     --output_dir "$output_dir" \
-    --deepspeed "$deepspeed_config" \
     --per_device_train_batch_size $per_device_train_batch_size \
     --num_train_epochs $num_train_epochs \
     --gradient_accumulation_steps $gradient_accumulation_steps \
