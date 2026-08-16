@@ -37,15 +37,7 @@ CONDITIONS = [
     'Interlobular septal thickening',
 ]
 
-# NOTE: 5 pulmonary lobes (NCKU ME dataset). Names must match the mask filenames
-# under <mask_folder>/seg_<volume_name>/<region>.nii.gz exactly.
-REGIONS = [
-    'right upper lobe',
-    'right middle lobe',
-    'right lower lobe',
-    'left upper lobe',
-    'left lower lobe',
-]
+from regions import REGIONS
 
 class RadGenomeDataset_Train(PersistentDataset):
     def __init__(self, text_tokenizer, data_folder, mask_folder, csv_file, cache_dir, max_region_size=5, max_img_size = 1, image_num = 32, region_num=33, max_seq=2048, resize_dim=500, voc_size=32000, force_num_frames=True):

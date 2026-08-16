@@ -16,14 +16,7 @@ import tqdm
 import random
 import pickle
 
-# NOTE: must stay identical to the REGIONS list in radgenome_dataset_train.py
-REGIONS = [
-    'right upper lobe',
-    'right middle lobe',
-    'right lower lobe',
-    'left upper lobe',
-    'left lower lobe',
-]
+from regions import REGIONS
 
 class RadGenomeDataset_Test(PersistentDataset):
     def __init__(self, text_tokenizer, data_folder, mask_folder, csv_file, cache_dir, inferenced_id, max_region_size=5, max_img_size = 1, image_num = 32, region_num=33, max_seq=2048, resize_dim=500, voc_size=32000, force_num_frames=True):

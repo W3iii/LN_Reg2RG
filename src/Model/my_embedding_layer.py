@@ -40,18 +40,7 @@ SCORES = [
 '[UNC]'
 ]
 
-REGIONS = [
-    'abdomen',
-    'bone',
-    'breast',
-    'esophagus',
-    'heart',
-    'lung',
-    'mediastinum',
-    'pleura',
-    'thyroid',
-    'trachea and bronchie',
-]
+from regions import REGIONS
 
 class MyEmbedding(nn.Module):
     def __init__(self, pretrained_visual_encoder=None, pretrained_adapter=None, num_embeddings=32000, embedding_dim=4096, perceiver_num=32, vis_dim=768, patch_size=32, frame_patch_size=4, seg_channel=256):

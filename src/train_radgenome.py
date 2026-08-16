@@ -12,18 +12,7 @@ import numpy as np
 import torch              
 import random
 
-REGIONS = [
-    'abdomen',
-    'bone',
-    'breast',
-    'esophagus',
-    'heart',
-    'lung',
-    'mediastinum',
-    'pleura',
-    'thyroid',
-    'trachea and bronchie',
-]
+from regions import REGIONS
 
 @dataclass
 class DataCollator(object):
