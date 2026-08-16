@@ -31,8 +31,28 @@ else
     echo "[train] DeepSpeed disabled (deepspeed_config is empty)"
 fi
 
+# Single GPU: launch with plain `python`, not torchrun.
+#
+# torchrun sets local_rank, so HF Trainer wraps the model in DDP even for one
+# process. The model enables reentrant gradient checkpointing, whose backward
+# replays the forward and fires autograd hooks twice per parameter; DDP then
+# aborts with "Expected to mark a variable ready only once" on the first
+# gradient sync (i.e. after gradient_accumulation_steps batches, so it looks
+# like training started fine).
+#
+# Multi-GPU still needs torchrun. Expect the same conflict there — fix it at
+# that point with non-reentrant checkpointing or DDP static graph, not by
+# reverting this.
+if [ "$nproc_per_node" -eq 1 ]; then
+    echo "[train] single GPU -> plain python (no DDP)"
+    launcher=(python)
+else
+    echo "[train] $nproc_per_node GPUs -> torchrun (DDP)"
+    launcher=(torchrun --nproc_per_node="$nproc_per_node" --master-port="$master_port")
+fi
+
 # 使用配置参数执行训练
-CUDA_VISIBLE_DEVICES=$cuda_devices torchrun --nproc_per_node=$nproc_per_node --master-port=$master_port  ../src/${script_name}.py \
+CUDA_VISIBLE_DEVICES=$cuda_devices "${launcher[@]}" ../src/${script_name}.py \
     "${ds_args[@]}" \
     --bf16 $bf16 \
     --lang_encoder_path "$lang_encoder_path" \

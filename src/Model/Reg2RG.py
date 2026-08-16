@@ -107,7 +107,10 @@ class Reg2RG(nn.Module):
             Accuracy = Acc / total
 
             # only rank 0 print
-            if torch.distributed.get_rank() == 0:
+            # NOTE: guard the rank check so the model also runs outside torchrun.
+            # Single-GPU training is launched with plain `python` to avoid the DDP
+            # wrapper, which is incompatible with reentrant gradient checkpointing.
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 print('lm_oss:', output['loss'].item())
 
             return dict(
