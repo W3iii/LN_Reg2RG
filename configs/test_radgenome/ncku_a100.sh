@@ -17,14 +17,21 @@ tokenizer_path="$CKPT_ROOT/Llama-2-7b-chat-hf"
 pretrained_visual_encoder="$CKPT_ROOT/Reg2RG/RadFM_vit3d.pth"
 pretrained_adapter="$CKPT_ROOT/Reg2RG/RadFM_perceiver_fc.pth"
 
-# Fine-tuned checkpoint produced by train_radgenome.sh
-# TODO: point at the epoch you want to evaluate, e.g. .../checkpoint-2790/pytorch_model.bin
-ckpt_path="$REPO_ROOT/outputs/$experiment_name/pytorch_model.bin"
+# Which checkpoint to evaluate. trainer.save_state() at the end of training only
+# writes optimizer/scheduler state — the weights live in checkpoint-<step>/, one
+# per epoch (save_total_limit keeps the last few). `ls outputs/$experiment_name`
+# to see what is available.
+ckpt_step="1390"
+ckpt_path="$REPO_ROOT/outputs/$experiment_name/checkpoint-${ckpt_step}/pytorch_model.bin"
 
-# Data — switch report_file to region_report_val.csv for model selection
+# Which split. Use val while choosing a checkpoint; switch to test only once.
+split="val"
+
 data_folder="$DATA_ROOT/images"
 mask_folder="$DATA_ROOT/masks"
-report_file="$DATA_ROOT/region_report_test.csv"
+report_file="$DATA_ROOT/region_report_${split}.csv"
 
-# Results — inside the project directory
-result_path="$REPO_ROOT/results/ncku_lobe5_test_reports.csv"
+# Results — tagged by split and checkpoint so runs do not overwrite each other.
+# test_radgenome.py appends and skips AccNums already present, so reusing one
+# filename across checkpoints silently produces no new rows.
+result_path="$REPO_ROOT/results/ncku_lobe5_${split}_ckpt${ckpt_step}.csv"
