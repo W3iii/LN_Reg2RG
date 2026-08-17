@@ -190,14 +190,32 @@ dtype as the existing region padding now does.
 
 ---
 
-## 5. Data contract
+## 5. Data contract — ✅ delivered
 
-Produced on the workstation, not here. Two additions to
+Produced on the workstation by `data_prep/export_nodule_masks.py`. In
 `/root/notebooks/groups/BME/reg2rg_nifti/`:
 
 ```
 masks/seg_<folder>/nodules.nii.gz     uint8, 0 = background, 1..N = nodule_id
+crop_offsets.csv                      folder, crop_y0/x0/z0, crop_h/w/d
 ```
+
+1400 patients, 5392 nodules, no errors. Same shape and affine as `images/` and the lobe
+masks — verified on CHEST1001: 54 voxels for nodule 1, matching its original
+`nodule_size`, and 100% of them inside that patient's LUL lobe mask, which agrees with
+`nodules.csv`. **No nodule falls outside the lung crop.**
+
+> **The mask's integer labels *are* `nodule_id`**, so `nodules.nii.gz` joins directly to
+> `nodule_metadata.csv` on `(Volumename, nodule_id)`. That was the point of labelling by
+> id rather than by connected-component order, and it resolves the deviation flagged in
+> §8: overflow ranking can use `tw_lung_rads` / `eq_diam_mm` as specified in §2 instead of
+> voxel count.
+
+186 voxels across 3 patients are contested by two overlapping bboxes; they go to the
+nearer bbox centre rather than to whichever instance was written last. Nodules whose only
+label is a doctor bbox (10 of 5392, no voxel mask) fill their box but claim only unowned
+voxels — filling unconditionally erased a real segmented nodule that one such box
+enclosed.
 
 **Why an instance mask rather than coordinates:** `data_prep/export_reg2rg.py` crops each
 volume to the lung bounding box plus 8 voxels and **does not record the crop origin**,
@@ -206,12 +224,20 @@ coordinates therefore cannot index the exported NIfTI. An instance mask in the s
 cropped frame as `images/` and `masks/` removes the bookkeeping entirely — lesion `k` is
 `mask == k` — and stays correct if the crop is ever changed.
 
-`nodule_metadata.csv` also gains the crop origin (`crop_y0`, `crop_x0`, `crop_z0`) so
-coordinates remain usable, and it already carries what the auxiliary head needs:
-`eq_diam_mm`, `bbox_long_mm`, `tw_lung_rads`, `lobe`, `nodule_id`.
+`nodule_metadata.csv` (38 columns) also carries the crop origin and cropped-frame
+coordinates, so bboxes are usable directly against the exported NIfTI:
 
-Until those land, develop against a stub that reads bboxes from `nodule_metadata.csv` and
-subtracts a recomputed crop origin. Do not commit the stub.
+```
+crop_y0 crop_x0 crop_z0 crop_h crop_w crop_d          crop origin and size
+y0_crop … z1_crop, cy_crop cx_crop cz_crop           bbox and centroid, cropped frame
+eq_diam_mm bbox_long_mm size_vox tw_lung_rads lobe   what the auxiliary head needs
+```
+
+No missing or negative cropped coordinates. Round-trip checked: slicing the instance mask
+with a nodule's `*_crop` bbox recovers exactly that nodule's voxels.
+
+Prefer `nodules.nii.gz` for the crops — it needs no arithmetic and survives a change of
+crop. Use the coordinates for the auxiliary head and for debugging.
 
 ---
 

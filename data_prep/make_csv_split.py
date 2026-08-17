@@ -68,8 +68,27 @@ M = N.merge(NS[['pid', 'nodule_id', 'matched_sentence', 'match_score', 'lobe_agr
 M = M.merge(agg[['pid', 'split']], on='pid', how='left')
 M['Volumename'] = M.folder + '.nii.gz'
 M['region'] = M.lobe.map(SHORT2REGION)
+
+# Coordinates above are in the *uncropped* npy frame, but the exported NIfTI is cropped to
+# the lung bbox. Carry the crop origin so they can be mapped in:
+#     cropped = original - crop_<axis>0
+# Lesion crops should normally come from masks/seg_<folder>/nodules.nii.gz instead, which
+# is already in the cropped frame. See Reg2RG/docs/LESION_TOKENS.md §5.
+off_p = os.path.join(OUT, 'crop_offsets.csv')
+if os.path.exists(off_p):
+    M = M.merge(pd.read_csv(off_p), on='folder', how='left')
+    for ax, o in (('y', 'crop_y0'), ('x', 'crop_x0'), ('z', 'crop_z0')):
+        for c in (f'{ax}0', f'{ax}1', f'c{ax}'):
+            M[f'{c}_crop'] = M[c] - M[o]
+else:
+    print('WARNING: %s missing — run export_nodule_masks.py first; '
+          'nodule_metadata.csv will have no cropped-frame coordinates' % off_p)
+
 cols = ['Volumename', 'pid', 'folder', 'split', 'nodule_id', 'region', 'lobe',
         'y0', 'x0', 'z0', 'y1', 'x1', 'z1', 'cy', 'cx', 'cz',
+        'crop_y0', 'crop_x0', 'crop_z0', 'crop_h', 'crop_w', 'crop_d',
+        'y0_crop', 'x0_crop', 'z0_crop', 'y1_crop', 'x1_crop', 'z1_crop',
+        'cy_crop', 'cx_crop', 'cz_crop',
         'size_vox', 'eq_diam_mm', 'bbox_long_mm', 'tw_lung_rads',
         'region_source', 'matched_sentence', 'match_score']
 M[[c for c in cols if c in M.columns]].to_csv(
