@@ -9,6 +9,7 @@ from Dataset.radgenome_dataset_test import RadGenomeDataset_Test
 # from args.test_combined_region_radgenome.superpod import ModelArguments, DataArguments
 from args.test_radgenome.jhcpu7 import ModelArguments, DataArguments
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from safetensors import safe_open
 import random
@@ -22,10 +23,26 @@ class DataCollator(object):
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         #print(instances) 'loss_reweight': reweight_tensor, 'key_words_query': emphasize_words
-        acc_nums, lang_xs, vision_xs, mask_xs, region2areas, questions, gt_combined_reports = tuple([instance[key] for instance in instances] for key in ('acc_num', 'lang_x','vision_x', 'mask_x', 'region2area', 'question', 'gt_combined_report'))
-        
+        acc_nums, lang_xs, vision_xs, mask_xs, region2areas, lesion_xs, lesion_slots_list, questions, gt_combined_reports = tuple([instance[key] for instance in instances] for key in ('acc_num', 'lang_x','vision_x', 'mask_x', 'region2area', 'lesion_x', 'lesion_slots', 'question', 'gt_combined_report'))
+
         lang_xs = torch.cat([_.unsqueeze(0) for _ in lang_xs], dim = 0)
-        
+
+        # docs/LESION_TOKENS.md §4: pad lesion_x / lesion_slots to this batch's max
+        # lesion count L, same as the train collator.
+        max_lesions = max((lx.shape[0] for lx in lesion_xs), default=0)
+        if max_lesions == 0:
+            lesion_x = torch.zeros((len(instances), 0, 1, 64, 64, 32), dtype=torch.float32)
+            lesion_slots = torch.zeros((len(instances), 0), dtype=torch.long)
+        else:
+            lesion_x = torch.stack([
+                F.pad(lx, (0, 0, 0, 0, 0, 0, 0, 0, 0, max_lesions - lx.shape[0]))
+                for lx in lesion_xs
+            ], dim=0)
+            lesion_slots = torch.stack([
+                F.pad(ls, (0, max_lesions - ls.shape[0]), value=-1)
+                for ls in lesion_slots_list
+            ], dim=0)
+
         vision_temp = {area: [] for area in REGIONS}
         mask_temp = {area: [] for area in REGIONS}
         # get the shape of the vision tensor
@@ -68,6 +85,8 @@ class DataCollator(object):
             vision_x=vision_xs,
             mask_x = mask_xs,
             region2area = region2areas,
+            lesion_x = lesion_x,
+            lesion_slots = lesion_slots,
             question = questions,
             gt_combined_report = gt_combined_reports,
         )
@@ -147,9 +166,11 @@ def main():
         vision_x = {area: _.cuda() for area, _ in sample["vision_x"].items()}
         mask_x = {area: _.cuda() for area, _ in sample["mask_x"].items()}
         region2area = sample["region2area"]
+        lesion_x = sample["lesion_x"].cuda()
+        lesion_slots = sample["lesion_slots"].cuda()
         gt_combined_report = sample["gt_combined_report"][0]
-        
-        pred_combined_reports = model.generate(lang_x, vision_x, mask_x, region2area)
+
+        pred_combined_reports = model.generate(lang_x, vision_x, mask_x, region2area, lesion_x, lesion_slots)
         pred_combined_report = pred_combined_reports[0]
 
         print('AccNum: ', acc_num)

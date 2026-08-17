@@ -25,6 +25,7 @@ Fork: `git@github.com:W3iii/LN_Reg2RG.git` (upstream `zhi-xuan-chen/Reg2RG`).
 | Inference on val | done — 142 samples |
 | Diagnosis of the trained model | **done, and it is the interesting result** — [§6](#6-what-the-trained-model-actually-does) |
 | Exact per-lobe metrics | done — [§6](#6-what-the-trained-model-actually-does) |
+| Lesion tokens (§7 route 2), repo-side | done — [`docs/LESION_TOKENS.md`](docs/LESION_TOKENS.md); blocked on real `nodules.nii.gz` from the workstation before it can train |
 
 ---
 

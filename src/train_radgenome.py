@@ -19,12 +19,29 @@ class DataCollator(object):
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         #print(instances) 'loss_reweight': reweight_tensor, 'key_words_query': emphasize_words
-        lang_xs, vision_xs, mask_xs, region2areas, attention_masks, labels = tuple([instance[key] for instance in instances] for key in ('lang_x', 'vision_x', 'mask_x', 'region2area', 'attention_mask', 'label'))
-        
+        lang_xs, vision_xs, mask_xs, region2areas, lesion_xs, lesion_slots_list, attention_masks, labels = tuple([instance[key] for instance in instances] for key in ('lang_x', 'vision_x', 'mask_x', 'region2area', 'lesion_x', 'lesion_slots', 'attention_mask', 'label'))
+
         lang_xs = torch.cat([_.unsqueeze(0) for _ in lang_xs], dim = 0)
         attention_masks = torch.cat([_.unsqueeze(0) for _ in attention_masks], dim = 0)
         labels = torch.cat([_.unsqueeze(0) for _ in labels], dim = 0)
-        
+
+        # docs/LESION_TOKENS.md §4: pad lesion_x / lesion_slots to this batch's max
+        # lesion count L. -1 slots are padding (MyEmbedding.forward's `valid` mask
+        # skips them), matching how absent regions are already zero-filled above.
+        max_lesions = max((lx.shape[0] for lx in lesion_xs), default=0)
+        if max_lesions == 0:
+            lesion_x = torch.zeros((len(instances), 0, 1, 64, 64, 32), dtype=torch.float32)
+            lesion_slots = torch.zeros((len(instances), 0), dtype=torch.long)
+        else:
+            lesion_x = torch.stack([
+                F.pad(lx, (0, 0, 0, 0, 0, 0, 0, 0, 0, max_lesions - lx.shape[0]))
+                for lx in lesion_xs
+            ], dim=0)
+            lesion_slots = torch.stack([
+                F.pad(ls, (0, max_lesions - ls.shape[0]), value=-1)
+                for ls in lesion_slots_list
+            ], dim=0)
+
         vision_temp = {area: [] for area in REGIONS}
         mask_temp = {area: [] for area in REGIONS}
         # get the shape of the vision tensor
@@ -71,6 +88,8 @@ class DataCollator(object):
             vision_x=vision_xs,
             mask_x=mask_xs,
             region2area = region2areas,
+            lesion_x = lesion_x,
+            lesion_slots = lesion_slots,
             attention_mask=attention_masks,
             labels = labels,
         )

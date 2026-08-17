@@ -23,3 +23,22 @@ REGIONS = [
     'left upper lobe',
     'left lower lobe',
 ]
+
+# Lesion tokens (docs/LESION_TOKENS.md). Same single-source-of-truth reasoning as
+# REGIONS above: the special-token list is built independently in
+# src/Model/Reg2RG.py and both src/Dataset/radgenome_dataset_{train,test}.py, and a
+# mismatch there doesn't raise — it silently selects the wrong embedding row.
+MAX_LESION_PER_REGION = 8
+
+
+def lesion_token_names(max_region_size):
+    """<lesion{slot}> names for every (region slot, lesion slot) pair.
+
+    Slots are a fixed grid — region slot j in [0, max_region_size), lesion slot k in
+    [0, MAX_LESION_PER_REGION) — so token ids stay static across samples regardless
+    of how many nodules a patient actually has. Unused slots are zero-filled and
+    never referenced by the prompt, the same way absent regions already work.
+    """
+    return [f'<lesion{j * MAX_LESION_PER_REGION + k}>'
+            for j in range(max_region_size)
+            for k in range(MAX_LESION_PER_REGION)]

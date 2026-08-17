@@ -247,3 +247,31 @@ measures how often the model says nothing.
 
 B1 matters for the write-up. Without it a reviewer will ask whether the resize schedule
 alone would have closed the gap.
+
+---
+
+## 8. Implementation status (repo side)
+
+§1–§4 are implemented: `regions.py` (`MAX_LESION_PER_REGION`, `lesion_token_names`),
+`lesion_utils.py` (crop/assignment math, shared by both Dataset classes),
+`LesionEncoder` + `MyEmbedding.forward` threading, `Reg2RG.py`'s special-token list and
+`forward`/`generate` signatures, both `radgenome_dataset_{train,test}.py`, and the
+`train_radgenome.py` / `test_radgenome.py` collators.
+
+**Everything here is a no-op today.** No `nodules.nii.gz` exists anywhere yet (see
+`HANDOFF_TO_LOCAL.md`), so every sample takes the empty-lesion path — verified with
+synthetic (non-repo) smoke tests: `LesionEncoder` on a zero-length batch, the scatter-index
+math in `MyEmbedding.forward` against a hand-built batch with 0/mixed/full lesion counts,
+`lesion_token_names(5)` as an exact prefix of `lesion_token_names(10)` (same reasoning as
+the existing `max_region_size` mismatch between `Reg2RG`'s default of 10 and the Dataset
+classes' default of 5), and `text_add_region_tokens` producing byte-identical output to
+before this change when `lesion_tokens_per_slot` is empty. None of this touched real
+patient data — no `nodules.nii.gz` exists to test against.
+
+**Deviates from §2 in one place:** overflow ranking (top `MAX_LESION_PER_REGION` per lobe)
+currently sorts by instance-mask voxel count, not `tw_lung_rads` desc / `eq_diam_mm` desc.
+`nodule_metadata.csv` isn't joinable to the instance mask's integer nodule ids yet — fix
+this once §5 lands (both are flagged inline in `radgenome_dataset_{train,test}.py`).
+
+**Not implemented:** §6 (auxiliary count/diameter head) — explicitly deferred until after
+§4 trains — and §7's B1/B3/B4 ablation arms, which are training runs, not repo changes.

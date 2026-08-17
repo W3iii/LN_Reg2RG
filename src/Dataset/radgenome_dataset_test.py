@@ -16,7 +16,8 @@ import tqdm
 import random
 import pickle
 
-from regions import REGIONS
+from regions import REGIONS, MAX_LESION_PER_REGION, lesion_token_names
+from lesion_utils import instance_bboxes, nodules_by_region, crop_lesion
 
 class RadGenomeDataset_Test(PersistentDataset):
     def __init__(self, text_tokenizer, data_folder, mask_folder, csv_file, cache_dir, inferenced_id, max_region_size=5, max_img_size = 1, image_num = 32, region_num=33, max_seq=2048, resize_dim=500, voc_size=32000, force_num_frames=True):
@@ -51,6 +52,13 @@ class RadGenomeDataset_Test(PersistentDataset):
                     "<region"+str(i*region_num+j)+">")
             self.region_padding_tokens.append(region_padding_tokens)
 
+        # docs/LESION_TOKENS.md §1: must be appended after every <region*> entry,
+        # and this list must match Reg2RG.py and radgenome_dataset_train.py exactly
+        # (rule 1 there) -- a mismatch doesn't raise, it just selects the wrong
+        # embedding row.
+        special_token["additional_special_tokens"].extend(
+            lesion_token_names(max_region_size))
+
         self.text_tokenizer.add_special_tokens(
             special_token
         )
@@ -60,7 +68,8 @@ class RadGenomeDataset_Test(PersistentDataset):
         self.text_tokenizer.bos_token_id = 1
         # treat the token with ID 2 as the eos token
         self.text_tokenizer.eos_token_id = 2
-        
+
+        self.max_region_size = max_region_size
         self.voc_size = voc_size
         self.max_seq = max_seq
         self.data_folder = data_folder
@@ -197,7 +206,46 @@ class RadGenomeDataset_Test(PersistentDataset):
             print('No mask: ', img_path)
             import sys
             sys.exit()
-        
+
+        # Lesion tokens (docs/LESION_TOKENS.md §5): read the nodule instance mask
+        # if it exists next to the region masks. It doesn't exist for any patient
+        # yet -- see HANDOFF_TO_LOCAL.md -- so this is a no-op today and starts
+        # producing lesion crops the moment nodules.nii.gz lands on disk. Crops
+        # come from `img_data` before CropForeground/Resize, i.e. the same native
+        # (0.8, 0.8, 1.0) mm frame export_reg2rg.py crops the instance mask into.
+        lesion_crops = {}
+        if mask_paths:
+            seg_dir = os.path.dirname(next(iter(mask_paths.values())))
+            instance_path = os.path.join(seg_dir, 'nodules.nii.gz')
+            if os.path.exists(instance_path):
+                instance_mask = nib.load(instance_path, mmap=True)
+                instance_mask = np.asarray(instance_mask.dataobj).astype(np.int32)
+                img_data_np = img_data.numpy()
+                region_binary_masks = {key: masks[i].numpy() for i, key in enumerate(mask_keys)}
+                assignment = nodules_by_region(instance_mask, region_binary_masks)
+                boxes = instance_bboxes(instance_mask)
+
+                per_region_nodules = {}
+                for nid, region in assignment.items():
+                    voxel_count = int(np.count_nonzero(instance_mask == nid))
+                    per_region_nodules.setdefault(region, []).append((nid, voxel_count))
+
+                lesion_hu_min, lesion_hu_max = -1000, 200
+                for region, nodules in per_region_nodules.items():
+                    # NOTE: ranked by voxel count as a size proxy.
+                    # docs/LESION_TOKENS.md §2 specifies tw_lung_rads desc, then
+                    # eq_diam_mm desc from nodule_metadata.csv -- switch to that
+                    # once the metadata carries an id joinable to this instance
+                    # mask's labels.
+                    nodules.sort(key=lambda t: t[1], reverse=True)
+                    crops = []
+                    for nid, _ in nodules[:MAX_LESION_PER_REGION]:
+                        crop = crop_lesion(img_data_np, boxes[nid])
+                        crop = np.clip(crop, lesion_hu_min, lesion_hu_max)
+                        crop = ((crop + 400) / 600).astype(np.float32)
+                        crops.append(crop)
+                    lesion_crops[region] = crops
+
         # process img_data
         img_data = img_data.unsqueeze(0)
         masks_data = torch.stack(masks, dim=0)
@@ -216,19 +264,24 @@ class RadGenomeDataset_Test(PersistentDataset):
         for i, key in enumerate(mask_keys):
             mask_tensors[key] = masks_tensor[i].unsqueeze(0)
 
-        return mask_img_tensors, mask_tensors
+        return mask_img_tensors, mask_tensors, lesion_crops
 
     def text_add_image_tokens(self, text):
-        
+
         text = '<image>' + self.image_padding_tokens[0] + '</image>' + '. ' + text
         text = "The global information is provided as the context: " + text
 
         return text
 
-    def text_add_region_tokens(self, text, num_regions):
+    def text_add_region_tokens(self, text, num_regions, lesion_tokens_per_slot=None):
+        lesion_tokens_per_slot = lesion_tokens_per_slot or {}
         region_text = ""
         for i in range(num_regions):
-            region_text = region_text + "The region " + str(i) + " is " + '<region>' + self.region_padding_tokens[i] + '</region>. ' 
+            region_text = region_text + "The region " + str(i) + " is " + '<region>' + self.region_padding_tokens[i] + '</region>'
+            lesion_tokens = lesion_tokens_per_slot.get(i, [])
+            if lesion_tokens:
+                region_text = region_text + " with lesions " + "".join(lesion_tokens)
+            region_text = region_text + '. '
         text = region_text + text
 
         return text
@@ -245,7 +298,7 @@ class RadGenomeDataset_Test(PersistentDataset):
             region_reports[key] = region_report
             mask_files[key] = mask_file
 
-        mask_img_tensors, mask_tensors = self.mask_img_to_tensor(img_file, mask_files)
+        mask_img_tensors, mask_tensors, lesion_crops = self.mask_img_to_tensor(img_file, mask_files)
 
         #NOTE: remove useless regions from region_reports according to mask_img_tensors, only used to compute region prediction accuracy
         for key in list(region_reports.keys()):
@@ -260,10 +313,35 @@ class RadGenomeDataset_Test(PersistentDataset):
         for i in range(len(shuffled_areas)):
             region2area[i] = shuffled_areas[i]
 
+        # Lesion tokens: slot indexing must follow region2area's slot i
+        # (docs/LESION_TOKENS.md §3), same as the train dataset -- getting this
+        # wrong attaches a lobe's lesions to a different lobe's region token and
+        # nothing errors.
+        lesion_crop_list = []
+        lesion_slot_list = []
+        lesion_tokens_per_slot = {}
+        for i in range(len(region2area)):
+            crops = lesion_crops.get(region2area[i], [])
+            if crops:
+                toks = []
+                for k, crop in enumerate(crops):
+                    slot = i * MAX_LESION_PER_REGION + k
+                    lesion_crop_list.append(crop)
+                    lesion_slot_list.append(slot)
+                    toks.append(f'<lesion{slot}>')
+                lesion_tokens_per_slot[i] = toks
+
+        if lesion_crop_list:
+            lesion_x = torch.stack(
+                [torch.from_numpy(c).unsqueeze(0) for c in lesion_crop_list], dim=0)
+        else:
+            lesion_x = torch.zeros((0, 1, 64, 64, 32), dtype=torch.float32)
+        lesion_slots = torch.tensor(lesion_slot_list, dtype=torch.long)
+
         instruction = "Given the provided global and regional information from this CT scan, please generate a comprehensive medical report for each region. First, identify the anatomical area corresponding to each region, then provide detailed information about these anatomical structures and any abnormalities that are essential. You can refer to the global information as the context and take it as a supplement when generating each region report."
-        
+
         # prompt = self.text_add_image_tokens(instruction)
-        prompt = self.text_add_region_tokens(instruction, num_regions=len(region2area))
+        prompt = self.text_add_region_tokens(instruction, num_regions=len(region2area), lesion_tokens_per_slot=lesion_tokens_per_slot)
 
         prompt = self.text_add_image_tokens(prompt)
 
@@ -280,10 +358,12 @@ class RadGenomeDataset_Test(PersistentDataset):
         text_input = text_tensor["input_ids"][0]
 
         return {'acc_num': self.data[index]['accnum'],
-                'lang_x': text_input, 
-                'vision_x': mask_img_tensors, 
+                'lang_x': text_input,
+                'vision_x': mask_img_tensors,
                 'mask_x': mask_tensors,
                 'region2area': region2area,
+                'lesion_x': lesion_x,
+                'lesion_slots': lesion_slots,
                 'question': prompt,
                 'gt_combined_report': combined_report
                 }

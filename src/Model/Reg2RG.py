@@ -2,6 +2,7 @@ from torch import nn
 from transformers.models.llama import LlamaForCausalLM
 from peft import get_peft_model, LoraConfig, TaskType
 from .my_embedding_layer import MyEmbedding
+from regions import lesion_token_names
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 import tqdm.auto as tqdm
 import torch.nn as nn
@@ -44,6 +45,11 @@ class Reg2RG(nn.Module):
                 special_token["additional_special_tokens"].append(
                     "<region"+str(i*image_num+j)+">")
             self.region_padding_tokens.append(region_padding_tokens)
+
+        # docs/LESION_TOKENS.md §1: must be appended after every <region*> entry,
+        # and this list must match the two Dataset classes' exactly (rule 1 there).
+        special_token["additional_special_tokens"].extend(
+            lesion_token_names(max_region_size))
 
         self.text_tokenizer.add_special_tokens(
             special_token
@@ -98,14 +104,14 @@ class Reg2RG(nn.Module):
         self.hidden_dim = 4096
         self.voc_size = 32000
 
-    def forward(self, lang_x, vision_x, mask_x, region2area, attention_mask, labels):
+    def forward(self, lang_x, vision_x, mask_x, region2area, attention_mask, labels, lesion_x=None, lesion_slots=None):
         if labels.shape == lang_x.shape:
             # lang_x = lang_x.to(vision_x.dtype)
             # lang_x = lang_x + torch.zeros(1, dtype=lang_x.dtype, device=lang_x.device, requires_grad=True)
             # vision_x = vision_x + torch.zeros(1, dtype=vision_x.dtype, device=vision_x.device, requires_grad=True)
             # input_embedding = checkpoint(self.embedding_layer, lang_x, vision_x)
-            
-            input_embedding = self.embedding_layer(vision_x, mask_x, lang_x, region2area)  
+
+            input_embedding = self.embedding_layer(vision_x, mask_x, lang_x, region2area, lesion_x, lesion_slots)
             
             output = self.lang_model(
                 inputs_embeds=input_embedding, attention_mask=attention_mask, labels=labels)
@@ -130,9 +136,9 @@ class Reg2RG(nn.Module):
                 loss=output['loss'],
             )
 
-    def generate(self, lang_x, vision_x, mask_x, region2area):
+    def generate(self, lang_x, vision_x, mask_x, region2area, lesion_x=None, lesion_slots=None):
         with torch.no_grad():
-            input_embedding = self.embedding_layer(vision_x, mask_x, lang_x, region2area)
+            input_embedding = self.embedding_layer(vision_x, mask_x, lang_x, region2area, lesion_x, lesion_slots)
             # print(input_embedding.shape)
             # input_embedding = torch.zeros(1, 544, 4096).cuda()
             generation = self.lang_model.generate(
