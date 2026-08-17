@@ -24,7 +24,7 @@ Fork: `git@github.com:W3iii/LN_Reg2RG.git` (upstream `zhi-xuan-chen/Reg2RG`).
 | Training (10 epochs, single A100) | done — loss 7.8 → 0.283, 4.3 h |
 | Inference on val | done — 142 samples |
 | Diagnosis of the trained model | **done, and it is the interesting result** — [§6](#6-what-the-trained-model-actually-does) |
-| Exact per-lobe metrics | **not yet run** — [§8](#8-open-items-in-priority-order) |
+| Exact per-lobe metrics | done — [§6](#6-what-the-trained-model-actually-does) |
 
 ---
 
@@ -261,23 +261,36 @@ position.
 
 ### But it is not reading the nodules
 
-Findings-by-lobe, hand-counted over the 142 val predictions (run the script in §8 for
-exact figures):
+Exact figures from `evaluation/analyze_region_predictions.py --result
+results/ncku_lobe5_val_ckpt1390.csv` (run 2026-08-17, 142 val samples), replacing the
+hand counts this section used to carry:
 
-| predicted finding location | ≈count |
-|---|---|
-| **LLL** | 48 |
-| **LUL** | 34 |
-| RLL | 17 |
-| RUL | 4 |
-| RML | 1 |
-| all five normal | 28 |
+| lobe | GT | PRED | TP | FP | FN | precision | recall | F1 |
+|---|---|---|---|---|---|---|---|---|
+| RUL | 69 | 4 | 3 | 1 | 66 | 0.750 | 0.043 | 0.082 |
+| RML | 52 | 1 | 1 | 0 | 51 | 1.000 | 0.019 | 0.038 |
+| RLL | 85 | 18 | 9 | 9 | 76 | 0.500 | 0.106 | 0.175 |
+| LUL | 53 | 38 | 14 | 24 | 39 | 0.368 | 0.264 | 0.308 |
+| LLL | 52 | 54 | 23 | 31 | 29 | 0.426 | 0.442 | 0.434 |
+| **micro** | 311 | 115 | 50 | 65 | 261 | 0.435 | 0.161 | 0.235 |
 
-The ground truth is spread roughly evenly across the five lobes. Three further symptoms:
+RUL and RML recall round to zero. LLL and LUL precision sit well above their base rate
+(52/710 ≈ 7% and 53/710 ≈ 7%), so the model is not purely reciting a language prior — it
+has some real grounding on those two lobes specifically — but it collapses onto them at
+the expense of the other three.
 
-1. **Almost always exactly one finding.** Only 2 of 142 predictions place findings in two
-   regions; the ground truth frequently has two or three.
-2. **Heavily templated.** Only the lobe name and a size in 0.3–0.8 cm vary.
+Findings per patient: GT mean 2.19 (median 2), PRED mean **0.81** (median 1). 87 of 142
+patients have ≥2 GT findings; only **2** of those 87 get ≥2 predicted findings. Stated
+size: GT median 5.0 mm (p90 8.0, max 55.0), PRED median 5.0 mm (p90 7.0, max **16.0**) —
+the model never predicts anything close to a large lesion, even when one is present in
+the ground truth.
+
+Three further symptoms:
+
+1. **Almost always exactly one finding**, confirmed above (PRED distribution: 0 findings
+   × 29 patients, 1 × 111, 2 × 2).
+2. **Heavily templated.** 115 finding sentences, only 67 distinct once the numbers are
+   masked out; the eight most common templates account for 43 of them.
 3. **Location uncorrelated with truth.** `CHEST1199` GT = RUL+RLL GGOs → predicted LUL.
    `CHESTCT1491` GT = RUL+RLL enlarging tumours, suspect lung cancer → predicted a 0.5 cm
    LLL nodule.
@@ -339,16 +352,19 @@ Insertion point in the model is `MyEmbedding` (`src/Model/my_embedding_layer.py`
 
 ## 8. Open items, in priority order
 
-1. **Run the diagnostic** and replace §6's hand counts with real numbers:
-   ```bash
-   python evaluation/analyze_region_predictions.py --result results/ncku_lobe5_val_ckpt1390.csv
-   ```
-   Per-lobe recall is the figure that matters. If RML/RUL recall is near zero while LLL
-   precision sits near that lobe's base rate, the language-prior diagnosis is confirmed.
+1. ~~Run the diagnostic and replace §6's hand counts with real numbers~~ — **done**, see
+   §6. RML/RUL recall is near zero as predicted, but LLL/LUL precision sits *above* their
+   lobe base rate rather than merely near it — the model has some real grounding on those
+   two lobes, it just collapses onto them instead of ignoring the image entirely. That
+   nuance matters for §7: a pure "fix the resolution loss" fix should be judged against
+   this partial-grounding baseline, not a from-scratch language-prior one.
 
 2. **Fix the residual text artifacts.** Normalisation in `data_prep/build_dataset.py`
    still leaks, and the model has learned to reproduce the damage — predictions contain
-   `"A RLL tiny nodule without as comparing."`:
+   `"A RLL tiny nodule without as comparing."`. **Must happen on the Windows box, not the
+   server** — the raw source reports only exist there, and at least one artifact (CJK
+   corruption) is upstream of `build_dataset.py` entirely. Root-cause analysis, concrete
+   examples, and per-artifact fix direction: [`HANDOFF_TO_LOCAL.md`](HANDOFF_TO_LOCAL.md).
 
    | residual | occurrences in training targets |
    |---|---|
