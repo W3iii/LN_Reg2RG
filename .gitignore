@@ -183,3 +183,6 @@ pretrain/
 
 # training outputs
 outputs/
+
+# NCKU hospital validation outputs (contain case-level clinical findings, not for public repo)
+results/ncku_*.csv

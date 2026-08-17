@@ -1,0 +1,95 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(//root/notebooks/groups/**)",
+      "Edit(//root/notebooks/groups/**)",
+      "Write(//root/notebooks/groups/**)",
+      "NotebookEdit(//root/notebooks/groups/**)",
+      "Glob(//root/notebooks/groups/**)",
+      "Grep(//root/notebooks/groups/**)",
+
+      "Read(//root/notebooks/tensorflow/**)",
+      "Edit(//root/notebooks/tensorflow/**)",
+      "Write(//root/notebooks/tensorflow/**)",
+      "NotebookEdit(//root/notebooks/tensorflow/**)",
+      "Glob(//root/notebooks/tensorflow/**)",
+      "Grep(//root/notebooks/tensorflow/**)",
+
+      "Read(//root/notebooks/env/**)",
+      "Edit(//root/notebooks/env/**)",
+      "Write(//root/notebooks/env/**)",
+      "NotebookEdit(//root/notebooks/env/**)",
+      "Glob(//root/notebooks/env/**)",
+      "Grep(//root/notebooks/env/**)",
+
+      "Read(//root/notebooks/automl/DL_HW1/**)",
+      "Edit(//root/notebooks/automl/DL_HW1/**)",
+      "Write(//root/notebooks/automl/DL_HW1/**)",
+      "NotebookEdit(//root/notebooks/automl/DL_HW1/**)",
+      "Glob(//root/notebooks/automl/DL_HW1/**)",
+      "Grep(//root/notebooks/automl/DL_HW1/**)",
+      "Read(//root/notebooks/automl/DL_HW1.zip)",
+      "Edit(//root/notebooks/automl/DL_HW1.zip)",
+      "Write(//root/notebooks/automl/DL_HW1.zip)",
+
+      "Read(//root/notebooks/automl/LAVT-BC/**)",
+      "Edit(//root/notebooks/automl/LAVT-BC/**)",
+      "Write(//root/notebooks/automl/LAVT-BC/**)",
+      "NotebookEdit(//root/notebooks/automl/LAVT-BC/**)",
+      "Glob(//root/notebooks/automl/LAVT-BC/**)",
+      "Grep(//root/notebooks/automl/LAVT-BC/**)",
+
+      "Read(//root/notebooks/automl/LAVT_med/**)",
+      "Edit(//root/notebooks/automl/LAVT_med/**)",
+      "Write(//root/notebooks/automl/LAVT_med/**)",
+      "NotebookEdit(//root/notebooks/automl/LAVT_med/**)",
+      "Glob(//root/notebooks/automl/LAVT_med/**)",
+      "Grep(//root/notebooks/automl/LAVT_med/**)",
+
+      "Read(//root/notebooks/automl/Swin-Unet/**)",
+      "Edit(//root/notebooks/automl/Swin-Unet/**)",
+      "Write(//root/notebooks/automl/Swin-Unet/**)",
+      "NotebookEdit(//root/notebooks/automl/Swin-Unet/**)",
+      "Glob(//root/notebooks/automl/Swin-Unet/**)",
+      "Grep(//root/notebooks/automl/Swin-Unet/**)",
+      "Read(//root/notebooks/automl/Swin-Unet.zip)",
+      "Edit(//root/notebooks/automl/Swin-Unet.zip)",
+      "Write(//root/notebooks/automl/Swin-Unet.zip)",
+
+      "Read(//root/notebooks/automl/env/**)",
+      "Edit(//root/notebooks/automl/env/**)",
+      "Write(//root/notebooks/automl/env/**)",
+      "NotebookEdit(//root/notebooks/automl/env/**)",
+      "Glob(//root/notebooks/automl/env/**)",
+      "Grep(//root/notebooks/automl/env/**)",
+
+      "Read(//root/notebooks/automl/.ipynb_checkpoints/**)",
+      "Edit(//root/notebooks/automl/.ipynb_checkpoints/**)",
+      "Write(//root/notebooks/automl/.ipynb_checkpoints/**)",
+
+      "Read(//root/notebooks/automl/create_venv.md)",
+      "Edit(//root/notebooks/automl/create_venv.md)",
+      "Write(//root/notebooks/automl/create_venv.md)",
+      "Read(//root/notebooks/automl/download_file.md)",
+      "Edit(//root/notebooks/automl/download_file.md)",
+      "Write(//root/notebooks/automl/download_file.md)",
+      "Read(//root/notebooks/automl/exit_train.md)",
+      "Edit(//root/notebooks/automl/exit_train.md)",
+      "Write(//root/notebooks/automl/exit_train.md)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/deny_nfs_paths.sh",
+            "statusMessage": "Checking NFS path policy..."
+          }
+        ]
+      }
+    ]
+  }
+}
