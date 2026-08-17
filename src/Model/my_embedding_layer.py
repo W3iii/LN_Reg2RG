@@ -128,7 +128,16 @@ class MyEmbedding(nn.Module):
         # D: 深"度，例如在处理三维数据（如3D图像或点云）时，这可能是数据的深度
 
         B, S, C, H, W, D = next(iter(vision_x.values())).shape
-        
+
+        # NOTE: the dataset emits fp32 volumes while this module runs in bf16.
+        # Training gets away with it because HF Trainer wraps the forward in an
+        # autocast context; generate() does not, so the ViT's first LayerNorm
+        # raises "expected scalar type Float but found BFloat16". Cast here so
+        # both paths behave the same rather than relying on an ambient autocast.
+        dtype = self.weight.dtype
+        vision_x = {k: v.to(dtype) for k, v in vision_x.items()}
+        mask_x = {k: v.to(dtype) for k, v in mask_x.items()}
+
         vision_temp = vision_x['image']
         vision_temp = rearrange(vision_temp, "b S c h w d-> (b S) c h w d")
         vision_temp, pos_embedding = self.vision_encoder(vision_temp)
