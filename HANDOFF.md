@@ -345,8 +345,15 @@ feature, as a direct measure of whether local information survived.
 coordinates, centroid, lobe, voxel count, equivalent-sphere diameter, bbox long axis,
 `TW_Lung_RADS`, and the matched report sentence.
 
-Insertion point in the model is `MyEmbedding` (`src/Model/my_embedding_layer.py`), where
-`region_embeddings` is assembled before being written into `vision_region_embedding`.
+> **Route 2 is specified in [`docs/LESION_TOKENS.md`](docs/LESION_TOKENS.md)** — token id ↔
+> embedding row alignment (the part that breaks silently), sizing, slot ordering, the
+> per-file change list, the data contract, and the ablation table. Read §1 of that document
+> before adding any special token.
+>
+> Division of labour: **the repository-side changes are yours**; the dataset-side artifacts
+> it depends on (a per-patient nodule instance mask, and the crop origin) are produced
+> separately on the workstation that holds the raw data. `LESION_TOKENS.md` §5 is the
+> contract between the two, including how to stub it while that is in flight.
 
 ---
 
