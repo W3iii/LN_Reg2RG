@@ -92,8 +92,12 @@ def region_taps(model, region_volume, mask_volume, device, dtype):
 
     fc_out = model.fc(post)                                 # (1, 32, 4096)
 
-    m = mask_volume.unsqueeze(0).to(device=device, dtype=dtype)
-    mask_emb, _ = model.mask_encoder(m.squeeze(0))
+    # mask_volume arrives from the dataset as (C=1, H, W, D); mask_encoder is a ViT
+    # that wants (B, C, H, W, D), which is exactly what the collator hands
+    # MyEmbedding.forward. So add the batch axis and pass it straight through --
+    # do not squeeze it back off.
+    m = mask_volume.unsqueeze(0).to(device=device, dtype=dtype)   # (1, 1, H, W, D)
+    mask_emb, _ = model.mask_encoder(m)
     mask_emb = model.mask_fc(mask_emb.mean(dim=1))          # (1, 4096)
 
     def pooled(t):
