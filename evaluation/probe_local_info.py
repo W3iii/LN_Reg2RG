@@ -90,7 +90,7 @@ def load_labels(csv_path, acc_col=None, lobe_col=None, diam_col=None):
     return grouped.size().rename('n_nodules'), grouped.diam.max().rename('max_diam')
 
 
-def assemble(npz_path, counts, diams):
+def assemble(npz_path, counts, diams, sets=None):
     d = np.load(npz_path, allow_pickle=True)
     acc, region = d['acc_num'].astype(str), d['region'].astype(str)
 
@@ -98,14 +98,18 @@ def assemble(npz_path, counts, diams):
     n = counts.reindex(idx).fillna(0).to_numpy()
     dm = diams.reindex(idx).fillna(0.0).to_numpy()
 
-    feats = {
-        'lobe_voxels': d['lobe_voxels'].reshape(-1, 1).astype(np.float64),
-        'mask_token': d['mask_token'].astype(np.float32),
-        'pre_perceiver': d['pre_perceiver'].astype(np.float32),
-        'post_perceiver': d['post_perceiver'].astype(np.float32),
-        'post_fc': d['post_fc'].astype(np.float32),
-    }
-    ok = np.isfinite(feats['lobe_voxels']).ravel()
+    names = sets or FEATURE_SETS
+    feats = {}
+    for name in names:
+        if name not in d:
+            raise SystemExit(
+                f'"{name}" is not in {npz_path}.\n  available: {sorted(d.files)}')
+        arr = d[name]
+        feats[name] = (arr.reshape(len(acc), -1).astype(np.float64) if arr.ndim == 1
+                       else arr.astype(np.float32))
+    ok = np.ones(len(acc), dtype=bool)
+    if 'lobe_voxels' in feats:
+        ok = np.isfinite(feats['lobe_voxels']).ravel()
     if not ok.all():
         print(f'  dropping {(~ok).sum()} rows with missing lobe volume')
         feats = {k: v[ok] for k, v in feats.items()}
@@ -209,10 +213,19 @@ def main():
     ap.add_argument('--lobe_col', default=None)
     ap.add_argument('--diam_col', default=None)
     ap.add_argument('--folds', type=int, default=5)
+    ap.add_argument('--sets', default=None,
+                    help='comma-separated feature keys to probe; defaults to the '
+                         'encoder tap points. Use e.g. lobe_voxels,native,resized '
+                         'for the model-free voxel features.')
+    ap.add_argument('--compare', default=None,
+                    help='comma-separated a-b pairs for paired CIs, e.g. '
+                         '"native-resized,native-lobe_voxels"')
     a = ap.parse_args()
 
+    sets = [s.strip() for s in a.sets.split(',')] if a.sets else None
     counts, diams = load_labels(a.nodule_metadata, a.acc_col, a.lobe_col, a.diam_col)
-    feats, acc, n_nod, max_diam = assemble(a.features, counts, diams)
+    feats, acc, n_nod, max_diam = assemble(a.features, counts, diams, sets)
+    names = sets or FEATURE_SETS
 
     has = (n_nod > 0).astype(int)
     print(f'\nregion rows: {len(has)}   with >=1 nodule: {has.sum()} ({has.mean():.1%})')
@@ -225,33 +238,33 @@ def main():
     print('=' * 70)
     print(f'{"prior":<18}{0.5:>8.3f}')
     auc, oof = {}, {}
-    for name in FEATURE_SETS:
+    for name in names:
         auc[name], ci, oof[name] = cv_binary(feats[name], has, acc, a.folds)
         print(f'{name:<18}{auc[name]:>8.3f}  [{ci[0]:.3f}, {ci[1]:.3f}]   dim={feats[name].shape[1]}')
 
-    print('\n' + '-' * 70)
-    print('paired differences that decide the story  (95% CI, same patients both arms)')
-    print('-' * 70)
-    for a_name, b_name, question in [
-        ('pre_perceiver', 'post_perceiver',
-         'is the 32-latent resampler where it dies?'),
-        ('pre_perceiver', 'lobe_voxels',
-         'do ViT patches beat just knowing lobe size?'),
-        ('post_fc', 'lobe_voxels',
-         'does what the LLM sees beat lobe size?'),
-    ]:
-        lo, hi = paired_delta_ci(has, oof[a_name], oof[b_name], acc)
-        d = auc[a_name] - auc[b_name]
-        verdict = 'CI excludes 0' if (lo > 0 or hi < 0) else 'CI includes 0 -- not resolved'
-        print(f'{a_name} - {b_name}')
-        print(f'    {question}')
-        print(f'    delta {d:+.3f}  [{lo:+.3f}, {hi:+.3f}]   {verdict}')
+    if a.compare:
+        pairs = [tuple(p.split('-', 1)) for p in a.compare.split(',')]
+    else:
+        pairs = [('pre_perceiver', 'post_perceiver'),
+                 ('pre_perceiver', 'lobe_voxels'),
+                 ('post_fc', 'lobe_voxels')]
+    pairs = [(x, y) for x, y in pairs if x in oof and y in oof]
+
+    if pairs:
+        print('\n' + '-' * 70)
+        print('paired differences  (95% CI, same patients resampled for both arms)')
+        print('-' * 70)
+        for a_name, b_name in pairs:
+            lo, hi = paired_delta_ci(has, oof[a_name], oof[b_name], acc)
+            d = auc[a_name] - auc[b_name]
+            verdict = 'CI excludes 0' if (lo > 0 or hi < 0) else 'CI includes 0 -- not resolved'
+            print(f'{a_name} - {b_name}:  delta {d:+.3f}  [{lo:+.3f}, {hi:+.3f}]   {verdict}')
 
     print('\n' + '=' * 62)
     print('how many nodules / how big?   (out-of-fold Spearman rho)')
     print('=' * 62)
     print(f'{"":<18}{"count":>10}{"max_diam":>12}')
-    for name in FEATURE_SETS:
+    for name in names:
         rc = cv_regression(feats[name], n_nod.astype(float), acc, a.folds)
         rd = cv_regression(feats[name], max_diam.astype(float), acc, a.folds)
         print(f'{name:<18}{rc:>10.3f}{rd:>12.3f}')
