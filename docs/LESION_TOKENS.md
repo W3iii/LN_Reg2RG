@@ -344,17 +344,52 @@ Nodule **count** and **max diameter** are at Spearman ρ ≤ 0.11 everywhere, wh
 measured version of §6's observation that predicted sizes never exceed 16 mm while the
 ground truth reaches 55 mm.
 
-Three hypotheses died here, and they are worth recording so nobody re-runs them:
+### The same probes on the train split
 
-- **the 32-latent resampler is the bottleneck** — no. pre − post is inside the noise.
+The val CIs above are wide enough to leave the two comparisons that matter unresolved, so
+the probes were rerun on train — 5580 lobes from 1116 patients, 45.0% positive, which
+narrows every interval by roughly 2.7×.
+
+| representation | train AUC | 95% CI | val AUC |
+|---|---|---|---|
+| `lobe_voxels` | 0.562 | [0.547, 0.576] | 0.561 |
+| `pre_perceiver` | 0.576 | [0.561, 0.591] | 0.611 |
+| `mask_token` | 0.592 | [0.577, 0.606] | 0.542 |
+| `post_fc` | 0.605 | [0.591, 0.620] | 0.598 |
+| `post_perceiver` | 0.606 | [0.592, 0.621] | 0.590 |
+
+| comparison | delta | verdict |
+|---|---|---|
+| `post_fc` − `lobe_voxels` | **+0.044 [+0.026, +0.060]** | resolved |
+| `pre_perceiver` − `post_perceiver` | **−0.030 [−0.042, −0.018]** | resolved, *negative* |
+| `pre_perceiver` − `lobe_voxels` | +0.015 [−0.005, +0.032] | not resolved |
+
+Nodule count reaches ρ = 0.206 at `post_fc`, against 0.002 for lobe size.
+
+These are training patients, so the encoder has seen them — but the point estimates match
+val almost exactly (`post_fc` 0.605 vs 0.598, `lobe_voxels` 0.562 vs 0.561). Memorisation
+would have made train visibly higher. It did not, so the train run is best read as the
+same measurement with enough power to resolve it.
+
+### What died, and what replaced it
+
+- **the 32-latent resampler is the bottleneck** — wrong, and backwards. `post_perceiver`
+  beats `pre_perceiver` by 0.030 with the CI excluding zero. The learned resampler
+  *improves* the representation relative to fixed mean/max pooling, which is unsurprising
+  once stated: it is trained and the pooling is not.
 - **the resize destroys it** — no. Native-resolution voxel statistics score the same as
-  post-resize ones. This also means the B1 ablation is not the load-bearing control it
-  was designed to be.
-- **the pooling in the probe was hiding it** — no. MIL over unpooled patch tokens, which
-  scores each patch and takes the best, does not beat mean/max pooling (0.587 vs 0.611).
+  post-resize ones (−0.002, CI [−0.035, +0.033]). B1 is therefore not the load-bearing
+  control it was designed to be.
+- **the probe's pooling was hiding it** — no. MIL over unpooled patch tokens does not
+  beat mean/max pooling (0.587 vs 0.611 on val).
+- **there is no lesion information at all** — also wrong, and this is the correction that
+  matters most. `post_fc` does beat lobe size, resolved on train. The representation the
+  LLM receives is not empty.
 
-What survives is simpler and better supported: at lobe granularity the signal-to-noise
-ratio is hopeless regardless of representation, and cropping to the lesion fixes it.
+What survives: the information is present but roughly an order of magnitude too weak.
+`post_fc` reaches 0.605 with 8192 dimensions; a single scalar taken at the lesion reaches
+0.837. The failure is one of scale, not of encoding — and that is exactly what a lesion
+crop addresses.
 
 **Caveat that must stay attached to the 0.837.** It uses ground-truth nodule locations.
 It is an oracle-localisation upper bound, not a deployable number, and the ablation table

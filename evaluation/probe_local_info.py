@@ -151,8 +151,12 @@ def cv_binary(X, y, groups, n_splits=5):
             oof[te] = y[tr].mean()
             continue
         gs = GridSearchCV(
+            # max_iter is generous because lbfgs on the 8192-dim post_fc features
+            # hit the 2000 cap in a handful of folds on the 5580-row train split.
+            # A non-converged fit still returns scores, so this fails silently
+            # into slightly-wrong AUCs rather than erroring.
             Pipeline([('sc', StandardScaler()),
-                      ('clf', LogisticRegression(max_iter=2000, class_weight='balanced'))]),
+                      ('clf', LogisticRegression(max_iter=20000, class_weight='balanced'))]),
             {'clf__C': [1e-3, 1e-2, 1e-1, 1.0]},
             scoring='roc_auc',
             cv=GroupKFold(n_splits=3).split(X[tr], y[tr], groups[tr]),
@@ -273,12 +277,19 @@ def main():
     print('reading this')
     print('=' * 62)
     print("""\
-A feature set at ~0.5 AUC carries nothing about lesions. One that matches
-lobe_voxels carries only lobe size. The decisive comparison is pre_perceiver vs
-post_perceiver: if pre is clearly higher, the 32-latent resampler is where the
-information dies, and changing the resize schedule (docs/LESION_TOKENS.md B1)
-cannot recover it -- 32 latents in, 32 latents out. If both are at the floor, the
-loss happens earlier, in the resize or the frozen ViT.""")
+A feature set at ~0.5 AUC carries nothing about lesions; one that matches
+lobe_voxels carries only lobe size. The comparison that pays is
+post_fc - lobe_voxels: whether what the LLM receives beats a single scalar.
+
+Reference values already measured on checkpoint-1390 (docs/LESION_TOKENS.md §9):
+post_fc 0.605, lobe_voxels 0.562, delta +0.044 with the CI excluding zero, and
+an oracle crop at the lesion reaching 0.837 on mean HU alone. So the lesion
+signal is present in the region representation but roughly an order of magnitude
+weaker than it is at lesion scale.
+
+Note pre_perceiver < post_perceiver there (-0.030, CI excludes 0): the learned
+resampler helps rather than bottlenecks, so a low pre_perceiver is not evidence
+against it.""")
 
 
 if __name__ == '__main__':

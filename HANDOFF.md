@@ -25,7 +25,9 @@ Fork: `git@github.com:W3iii/LN_Reg2RG.git` (upstream `zhi-xuan-chen/Reg2RG`).
 | Inference on val | done — 142 samples |
 | Diagnosis of the trained model | **done, and it is the interesting result** — [§6](#6-what-the-trained-model-actually-does) |
 | Exact per-lobe metrics | done — [§6](#6-what-the-trained-model-actually-does) |
-| Lesion tokens (§7 route 2), repo-side | done — [`docs/LESION_TOKENS.md`](docs/LESION_TOKENS.md); blocked on real `nodules.nii.gz` from the workstation before it can train |
+| Probing where local information is lost | done — [`docs/LESION_TOKENS.md`](docs/LESION_TOKENS.md) §9; three candidate mechanisms rejected |
+| Lesion tokens (§7 route 2), repo-side | done and runnable — boxes come from `nodule_metadata.csv`, no workstation dependency. Off by default; enable with `nodule_metadata=` |
+| Baseline noise floor (3 seeds) | in progress — needed before any B0-vs-B2 comparison can be read |
 
 ---
 
@@ -296,21 +298,43 @@ Three further symptoms:
    `CHESTCT1491` GT = RUL+RLL enlarging tumours, suspect lung cancer → predicted a 0.5 cm
    LLL nodule.
 
-### Why — and this is the point
+### Why — measured, not inferred
 
-Measured over 40 patients / 75 nodules: a lobe's bounding box is median 183×156×167
-voxels, so resizing it to the encoder's `(256, 256, 64)` scales y by 1.40×, x by 1.64×,
-and z by **0.38×**. A median 4.7 mm nodule goes from 5.9×5.9×4.7 voxels to 7.8×9.6×**1.7**.
-After patch embedding at (16,16,4) it occupies **0.117 of one patch — 94.7% of nodules
-are smaller than a single token** (100% at (32,32,4)).
+The original explanation here was a resize argument: a lobe bbox is median 183×156×167
+voxels, so `(256, 256, 64)` scales z by **0.38×**, and after patch embedding a median
+4.7 mm nodule occupies a fraction of one token. That arithmetic is still true, but as a
+*mechanism* it did not survive testing.
 
-So the model can see a lobe (hundreds of tokens) but **cannot physically see a 5 mm
-nodule**. Deprived of the signal, it falls back on the language prior and emits the most
-common report in the training distribution: one small benign-looking nodule in a lower
-left lobe.
+Probing the representation directly — no LLM, no text generation, no regex parsing — gives
+this, for "does this lobe contain a nodule" (train split, 5580 lobes, 1116 patients,
+patient-level CIs, full detail in [`docs/LESION_TOKENS.md`](docs/LESION_TOKENS.md) §9):
 
-This is not undertraining. It is a quantifiable, attributable failure of the region
-representation — which makes it a clean motivation for §7.
+| representation | AUC | 95% CI |
+|---|---|---|
+| lobe size alone (one scalar) | 0.562 | [0.547, 0.576] |
+| what the LLM receives (`post_fc`) | 0.605 | [0.591, 0.620] |
+| **oracle crop at the lesion, mean HU alone** | **0.837** | — |
+
+`post_fc` − lobe size is **+0.044 [+0.026, +0.060]**, so the region representation is not
+empty — it carries real lesion information, about an order of magnitude weaker than the
+same voxels carry at lesion scale. Nodule count reaches ρ = 0.206 there against 0.002 for
+lobe size; diameter stays near zero, which is the measured form of the observation above
+that predictions never exceed 16 mm.
+
+Three candidate mechanisms were tested and rejected: the 32-latent resampler is **not** a
+bottleneck (it measurably helps, −0.030 with the CI excluding zero in the wrong direction
+for that story); the resize is **not** the mechanism (native-resolution voxel statistics
+score the same as post-resize, −0.002 [−0.035, +0.033]); and the pooling used by the probe
+was not hiding anything (MIL over unpooled patch tokens does not beat it).
+
+What is left is a scale mismatch rather than an encoding failure. A 5 mm nodule is roughly
+65 voxels inside a ~4 M voxel lobe — 0.0016% — so no summary of a whole lobe, learned or
+hand-built, can hold it. Deprived of a usable signal, the model falls back on the language
+prior and emits the most common report in the training distribution: one small
+benign-looking nodule in a lower left lobe.
+
+Still not undertraining. It is a quantifiable, attributable failure — and now the
+attribution is measured, which is what §7 has to be built on.
 
 ---
 
@@ -322,8 +346,13 @@ matter how many nodules a scan has (the data goes up to 67 in one patient; p99 =
 `max_region_size` is fixed at training time, so any per-nodule region scheme has a hard
 inference ceiling. Reports also read closer to how radiologists write.
 
-The cost is exactly the resolution loss in §6. Four ways to recover it, roughly in
-increasing ambition:
+The cost is the scale mismatch in §6. Note the measurements there reorder the options
+below: **route 1 (anisotropic resize) is no longer a promising baseline**, because
+native-resolution voxel statistics score the same as post-resize ones. Keep it as an
+ablation arm for the write-up if a reviewer would ask, but do not expect it to move
+anything. Route 2 is what the evidence points at.
+
+Four ways to recover it, roughly in increasing ambition:
 
 1. **Anisotropic resize** — the damage is mostly the z 0.38×. Changing the target to
    e.g. `(224, 224, 128)` recovers much of it for free. **This is the baseline ablation**:

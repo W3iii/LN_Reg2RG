@@ -186,3 +186,18 @@ outputs/
 
 # NCKU hospital validation outputs (contain case-level clinical findings, not for public repo)
 results/ncku_*.csv
+
+# Probe artifacts derived from patient scans. These are NOT safe for this repo:
+# every row carries a real accession number (CHESTxxxx) alongside a learned
+# representation of that patient's lobe, so committing them publishes an
+# institutional patient list. features_val_ckpt1390.npz was committed by mistake
+# and scrubbed from the unpushed history on 2026-08-18; these rules exist so the
+# next one does not get that far. All of it regenerates from a checkpoint plus
+# the dataset.
+results/features_*.npz
+results/patch_tokens_*.npy
+results/voxel_*.npz
+
+# MONAI cache and probe logs
+outputs/monai_cache/
+outputs/seed_sweep_logs/
