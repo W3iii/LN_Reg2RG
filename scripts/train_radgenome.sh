@@ -64,6 +64,7 @@ CUDA_VISIBLE_DEVICES=$cuda_devices "${launcher[@]}" ../src/${script_name}.py \
     --report_file "$report_file" \
     --monai_cache_dir "$monai_cache_dir" \
     --output_dir "$output_dir" \
+    --seed $seed \
     --per_device_train_batch_size $per_device_train_batch_size \
     --num_train_epochs $num_train_epochs \
     --gradient_accumulation_steps $gradient_accumulation_steps \
@@ -75,5 +76,5 @@ CUDA_VISIBLE_DEVICES=$cuda_devices "${launcher[@]}" ../src/${script_name}.py \
     --warmup_steps $warmup_steps \
     --lr_scheduler_type "$lr_scheduler_type" \
     --dataloader_num_workers $dataloader_num_workers \
-    --run_name "$experiment_name" \
+    --run_name "${experiment_name}_seed${seed}" \
     --logging_steps $logging_steps

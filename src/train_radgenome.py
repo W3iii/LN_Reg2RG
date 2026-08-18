@@ -103,9 +103,18 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
                  
 def main():
-    set_seed(42)
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    # NOTE: seed comes from --seed (HF TrainingArguments already defines it, default
+    # 42) rather than being hardcoded, so a run can be repeated under several seeds
+    # to establish the run-to-run noise floor. Two architecturally identical runs of
+    # this config gave micro-F1 0.235 and 0.439 (HANDOFF.md §6), i.e. the variance
+    # is larger than any effect worth claiming -- no single run means anything on its
+    # own. Give each seed its own output_dir; HF Trainer's checkpoint rotation sorts
+    # by mtime, so sharing one directory makes later runs delete earlier ones.
+    set_seed(training_args.seed)
+    print(f'[train] seed={training_args.seed} output_dir={training_args.output_dir}')
 
     print("Setup Data")
     Train_dataset = RadGenomeDataset_Train(

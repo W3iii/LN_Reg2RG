@@ -24,6 +24,12 @@ pretrained_adapter="$CKPT_ROOT/Reg2RG/RadFM_perceiver_fc.pth"
 ckpt_step="1390"
 ckpt_path="$REPO_ROOT/outputs/$experiment_name/checkpoint-${ckpt_step}/pytorch_model.bin"
 
+# Distinguishes this run's result CSV from other runs that happen to land on the
+# same checkpoint step number (e.g. a from-scratch retrain after a code change —
+# same epoch math, same step numbers, but genuinely different weights). Bump this
+# any time you retrain into the same experiment_name/output_dir.
+run_tag="lesion_v1"
+
 # Which split. Use val while choosing a checkpoint; switch to test only once.
 split="val"
 
@@ -31,7 +37,8 @@ data_folder="$DATA_ROOT/images"
 mask_folder="$DATA_ROOT/masks"
 report_file="$DATA_ROOT/region_report_${split}.csv"
 
-# Results — tagged by split and checkpoint so runs do not overwrite each other.
-# test_radgenome.py appends and skips AccNums already present, so reusing one
-# filename across checkpoints silently produces no new rows.
-result_path="$REPO_ROOT/results/ncku_lobe5_${split}_ckpt${ckpt_step}.csv"
+# Results — tagged by split, checkpoint, and run_tag so runs do not overwrite (or
+# get silently skipped against) each other. test_radgenome.py appends and skips
+# AccNums already present, so reusing one filename across genuinely different
+# models silently produces no new rows.
+result_path="$REPO_ROOT/results/ncku_lobe5_${split}_ckpt${ckpt_step}_${run_tag}.csv"

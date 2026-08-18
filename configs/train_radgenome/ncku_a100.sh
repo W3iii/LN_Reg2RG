@@ -3,6 +3,13 @@
 experiment_name="Reg2RG_ncku_lobe5"
 bf16=True
 
+# Random seed. Two runs of this config that were architecturally identical scored
+# micro-F1 0.235 and 0.439 (HANDOFF.md §6), so the run-to-run spread is wider than
+# any effect the lesion-token work hopes to demonstrate. Sweep this over several
+# values and report mean ± std before comparing anything against anything.
+# Override per run:  seed=1 bash train_radgenome.sh ncku_a100
+seed="${seed:-42}"
+
 # ---- roots -------------------------------------------------------------
 # Dataset lives on the shared group volume; pretrained weights and everything
 # this run produces stay inside the project directory.
@@ -29,8 +36,11 @@ mask_folder="$DATA_ROOT/masks"
 report_file="$DATA_ROOT/region_report_train.csv"
 monai_cache_dir="$DATA_ROOT/cache" # useless
 
-# Outputs — inside the project directory
-output_dir="$REPO_ROOT/outputs/$experiment_name"
+# Outputs — inside the project directory, one directory per seed.
+# HF Trainer's _rotate_checkpoints sorts by mtime, not by step, so a second run
+# writing into an existing output_dir deletes the earlier run's checkpoints once
+# save_total_limit is reached — silently, and regardless of step numbering.
+output_dir="$REPO_ROOT/outputs/${experiment_name}_seed${seed}"
 
 # DeepSpeed — empty means "don't use it".
 # On a single 80 GB A100 with LoRA, ZeRO-2 mainly shards optimizer state, which
