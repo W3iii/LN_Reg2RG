@@ -245,10 +245,10 @@ class MyEmbedding(nn.Module):
 
         # NOTE: lesion tokens (docs/LESION_TOKENS.md). Fixed grid of
         # max_region * MAX_LESION_PER_REGION slots, same zero-fill-if-absent
-        # convention as vision_region_embedding above — a sample/batch with no
-        # nodule crops at all (true for every sample today; nodules.nii.gz
-        # doesn't exist yet, see HANDOFF_TO_LOCAL.md) leaves this all zeros and
-        # is otherwise identical to the pre-lesion-token forward pass.
+        # convention as vision_region_embedding above. When the dataset is built
+        # without nodule_metadata (the B0 baseline arm), lesion_x is empty and
+        # this stays all zeros, making the forward pass identical to the
+        # pre-lesion-token one.
         # lesion_x     : (B, L, C, 64, 64, 32), L = max lesions in this batch
         # lesion_slots : (B, L) int, flat region*MAX_LESION_PER_REGION+lesion
         #                index; -1 marks padding

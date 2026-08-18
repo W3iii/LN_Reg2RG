@@ -38,10 +38,15 @@ CONDITIONS = [
 ]
 
 from regions import REGIONS, MAX_LESION_PER_REGION, lesion_token_names
-from lesion_utils import instance_bboxes, nodules_by_region, crop_lesion
+from lesion_utils import load_nodule_index, crop_lesion, normalize_lesion
 
 class RadGenomeDataset_Train(PersistentDataset):
-    def __init__(self, text_tokenizer, data_folder, mask_folder, csv_file, cache_dir, max_region_size=5, max_img_size = 1, image_num = 32, region_num=33, max_seq=2048, resize_dim=500, voc_size=32000, force_num_frames=True):
+    # NOTE: nodule_metadata defaults to None, i.e. lesion tokens OFF. The B0
+    # baseline and the B2 lesion arm differ only by this argument, so the two are
+    # runnable from one checkout -- and, more importantly, a seed sweep started
+    # before the lesion work landed keeps producing baseline runs instead of
+    # silently switching arms partway through.
+    def __init__(self, text_tokenizer, data_folder, mask_folder, csv_file, cache_dir, max_region_size=5, max_img_size = 1, image_num = 32, region_num=33, max_seq=2048, resize_dim=500, voc_size=32000, force_num_frames=True, nodule_metadata=None):
         # text_tokenizer
         self.text_tokenizer = AutoTokenizer.from_pretrained(
                 text_tokenizer,
@@ -90,6 +95,12 @@ class RadGenomeDataset_Train(PersistentDataset):
         self.text_tokenizer.eos_token_id = 2
 
         self.max_region_size = max_region_size
+        self.nodule_index = (
+            load_nodule_index(nodule_metadata, MAX_LESION_PER_REGION)
+            if nodule_metadata else None)
+        if self.nodule_index is not None:
+            print(f'[dataset] lesion tokens ON: {len(self.nodule_index)} '
+                  f'(volume, region) pairs from {nodule_metadata}')
         self.voc_size = voc_size
         self.max_seq = max_seq
         self.data_folder = data_folder
@@ -232,42 +243,19 @@ class RadGenomeDataset_Train(PersistentDataset):
         if not flag:
             print('No mask: ', img_path)
 
-        # Lesion tokens (docs/LESION_TOKENS.md §5): read the nodule instance mask
-        # if it exists next to the region masks. It doesn't exist for any patient
-        # yet -- see HANDOFF_TO_LOCAL.md -- so this is a no-op today and starts
-        # producing lesion crops the moment nodules.nii.gz lands on disk. Crops
-        # come from `img_data` before CropForeground/Resize, i.e. the same native
-        # (0.8, 0.8, 1.0) mm frame export_reg2rg.py crops the instance mask into.
+        # Lesion crops, cut from img_data *before* CropForeground/Resize -- the
+        # boxes in nodule_metadata.csv are in exactly that cropped-export frame,
+        # and the whole point is to keep native (0.8, 0.8, 1.0) mm resolution
+        # rather than the lobe pathway's downsampled view.
         lesion_crops = {}
-        if mask_paths:
-            seg_dir = os.path.dirname(next(iter(mask_paths.values())))
-            instance_path = os.path.join(seg_dir, 'nodules.nii.gz')
-            if os.path.exists(instance_path):
-                instance_mask = nib.load(instance_path).get_fdata().astype(np.int32)
-                region_binary_masks = {key: masks[i] for i, key in enumerate(mask_keys)}
-                assignment = nodules_by_region(instance_mask, region_binary_masks)
-                boxes = instance_bboxes(instance_mask)
-
-                per_region_nodules = {}
-                for nid, region in assignment.items():
-                    voxel_count = int(np.count_nonzero(instance_mask == nid))
-                    per_region_nodules.setdefault(region, []).append((nid, voxel_count))
-
-                lesion_hu_min, lesion_hu_max = -1000, 200
-                for region, nodules in per_region_nodules.items():
-                    # NOTE: ranked by voxel count as a size proxy.
-                    # docs/LESION_TOKENS.md §2 specifies tw_lung_rads desc, then
-                    # eq_diam_mm desc from nodule_metadata.csv -- switch to that
-                    # once the metadata carries an id joinable to this instance
-                    # mask's labels.
-                    nodules.sort(key=lambda t: t[1], reverse=True)
-                    crops = []
-                    for nid, _ in nodules[:MAX_LESION_PER_REGION]:
-                        crop = crop_lesion(img_data, boxes[nid])
-                        crop = np.clip(crop, lesion_hu_min, lesion_hu_max)
-                        crop = ((crop + 400) / 600).astype(np.float32)
-                        crops.append(crop)
-                    lesion_crops[region] = crops
+        if self.nodule_index is not None:
+            # nodule_metadata.csv keys on Volumename, which includes the suffix
+            volume_name = os.path.basename(img_path)
+            for region in mask_paths:
+                boxes = self.nodule_index.get((volume_name, region))
+                if boxes:
+                    lesion_crops[region] = [
+                        normalize_lesion(crop_lesion(img_data, b)) for b in boxes]
 
         # process img_data
         img_data = img_data[np.newaxis, ...]

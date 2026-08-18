@@ -63,6 +63,7 @@ CUDA_VISIBLE_DEVICES=$cuda_devices "${launcher[@]}" ../src/${script_name}.py \
     --mask_folder "$mask_folder" \
     --report_file "$report_file" \
     --monai_cache_dir "$monai_cache_dir" \
+    --nodule_metadata "$nodule_metadata" \
     --output_dir "$output_dir" \
     --seed $seed \
     --per_device_train_batch_size $per_device_train_batch_size \

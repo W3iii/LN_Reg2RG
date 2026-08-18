@@ -19,6 +19,9 @@ class DataArguments:
     mask_folder: Optional[str] = field(default='/data/chenzhixuan/data/RadGenome-ChestCT/dataset/valid_region_mask')
     report_file: Optional[str] = field(default='/data/chenzhixuan/data/RadGenome-ChestCT/dataset/radgenome_files/validation_region_report.csv')
     monai_cache_dir: Optional[str] = field(default='/jhcnas5/chenzhixuan/data/RadGenome-ChestCT/cache')
+    # Empty = lesion tokens off (the B0 baseline). Point it at nodule_metadata.csv
+    # to run the B2 lesion arm; see docs/LESION_TOKENS.md.
+    nodule_metadata: Optional[str] = field(default='')
     
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):

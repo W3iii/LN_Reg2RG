@@ -126,7 +126,8 @@ def main():
         mask_folder=data_args.mask_folder,
         csv_file=data_args.report_file,
         cache_dir=data_args.monai_cache_dir,
-        inferenced_id = inferenced_id
+        inferenced_id = inferenced_id,
+        nodule_metadata=data_args.nodule_metadata or None,
     )
 
     Test_dataloader = DataLoader(

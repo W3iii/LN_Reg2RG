@@ -3,11 +3,19 @@
 Extends Reg2RG so lesion-level detail survives the region encoder, while keeping the
 region set fixed at the 5 pulmonary lobes.
 
-**Why:** see `../HANDOFF.md` §6. Resizing a lobe to the encoder's `(256, 256, 64)` scales
-z by 0.38×; a median 4.7 mm nodule ends up at 0.117 of one patch token, and 94.7% of
-nodules are smaller than a single token. The trained baseline identifies lobes almost
-perfectly but places findings by language prior, because the nodules are not in the
-representation at all.
+**Why:** see `../HANDOFF.md` §6, and §9 below for the measurements that replaced the
+original reasoning. Briefly: every lobe-level representation that was probed — ViT patch
+tokens, perceiver latents, what the LLM receives, and model-free voxel statistics at
+native resolution — lands between 0.54 and 0.61 AUC for "does this lobe contain a
+nodule", statistically indistinguishable from knowing only how big the lobe is. Cropped
+to the lesion, a *single scalar* (mean HU) reaches 0.837. A 5 mm nodule is roughly 65
+voxels inside a 4 M voxel lobe, so no pooled summary of a lobe can hold it. That gap,
+0.6 against 0.84, is what this design is trying to close.
+
+Note the original explanation — that the z 0.38× resize is what destroys the signal —
+did **not** survive measurement: native-resolution voxel statistics score the same as
+post-resize ones (delta −0.002, CI [−0.035, +0.033]). The resize is not the mechanism;
+the scale mismatch is.
 
 **Idea:** crop each nodule at native resolution, encode it to **one token**, and append
 those tokens to the owning lobe's region block. One token per nodule against 33 for a
@@ -192,12 +200,13 @@ dtype as the existing region padding now does.
 
 ## 5. Data contract — ✅ delivered
 
-Produced on the workstation by `data_prep/export_nodule_masks.py`. In
-`/root/notebooks/groups/BME/reg2rg_nifti/`:
+Produced on the workstation by `data_prep/export_nodule_masks.py` and
+`make_csv_split.py`. In `/root/notebooks/groups/BME/reg2rg_nifti/`:
 
 ```
 masks/seg_<folder>/nodules.nii.gz     uint8, 0 = background, 1..N = nodule_id
 crop_offsets.csv                      folder, crop_y0/x0/z0, crop_h/w/d
+nodule_metadata.csv                   38 cols, incl. crop origin + cropped-frame boxes
 ```
 
 1400 patients, 5392 nodules, no errors. Same shape and affine as `images/` and the lobe
@@ -207,9 +216,8 @@ masks — verified on CHEST1001: 54 voxels for nodule 1, matching its original
 
 > **The mask's integer labels *are* `nodule_id`**, so `nodules.nii.gz` joins directly to
 > `nodule_metadata.csv` on `(Volumename, nodule_id)`. That was the point of labelling by
-> id rather than by connected-component order, and it resolves the deviation flagged in
-> §8: overflow ranking can use `tw_lung_rads` / `eq_diam_mm` as specified in §2 instead of
-> voxel count.
+> id rather than by connected-component order, and it is what lets overflow ranking use
+> `tw_lung_rads` / `eq_diam_mm` as specified in §2 instead of voxel count.
 
 186 voxels across 3 patients are contested by two overlapping bboxes; they go to the
 nearer bbox centre rather than to whichever instance was written last. Nodules whose only
@@ -217,15 +225,8 @@ label is a doctor bbox (10 of 5392, no voxel mask) fill their box but claim only
 voxels — filling unconditionally erased a real segmented nodule that one such box
 enclosed.
 
-**Why an instance mask rather than coordinates:** `data_prep/export_reg2rg.py` crops each
-volume to the lung bounding box plus 8 voxels and **does not record the crop origin**,
-while `nodule_metadata.csv` holds coordinates in the *uncropped* npy frame. Those
-coordinates therefore cannot index the exported NIfTI. An instance mask in the same
-cropped frame as `images/` and `masks/` removes the bookkeeping entirely — lesion `k` is
-`mask == k` — and stays correct if the crop is ever changed.
-
-`nodule_metadata.csv` (38 columns) also carries the crop origin and cropped-frame
-coordinates, so bboxes are usable directly against the exported NIfTI:
+`make_csv_split.py` merges the crop origin into `nodule_metadata.csv` and derives
+cropped-frame columns, so boxes are also usable directly against the exported NIfTI:
 
 ```
 crop_y0 crop_x0 crop_z0 crop_h crop_w crop_d          crop origin and size
@@ -236,8 +237,41 @@ eq_diam_mm bbox_long_mm size_vox tw_lung_rads lobe   what the auxiliary head nee
 No missing or negative cropped coordinates. Round-trip checked: slicing the instance mask
 with a nodule's `*_crop` bbox recovers exactly that nodule's voxels.
 
-Prefer `nodules.nii.gz` for the crops — it needs no arithmetic and survives a change of
-crop. Use the coordinates for the auxiliary head and for debugging.
+### Which of the two the training path uses, and why
+
+Both are correct. `src/lesion_utils.py` reads the **cropped-frame boxes**, not the
+instance mask, for one reason: throughput. The boxes are a single CSV read at dataset
+construction, while the mask is another NIfTI of image size to open per sample — roughly
+1116 × 10 extra volume loads over a training run, on NFS, against a 4.5 h baseline.
+
+The mask remains the better artifact wherever that cost does not apply, and the note in
+the original contract still holds: it needs no arithmetic and stays correct if
+`export_reg2rg.py`'s crop ever changes, which would silently invalidate every stored
+coordinate. Use it for the auxiliary head, for verification, and for anything needing
+voxel-level lesion extent rather than a window.
+
+If the crop is ever changed, `lesion_utils` must be repointed at the mask or the
+coordinates regenerated — there is no third option, and nothing will raise.
+
+### Independent verification of the box path
+
+Checked on the server against the exported volumes, 2026-08-18:
+
+| check | result |
+|---|---|
+| rows with a missing crop column | 0 of 5392 |
+| `crop_h/w/d` vs exported image shape | 25 / 25 match |
+| split coverage | train 4287, val 539, test 566 |
+| `region` values vs `src/regions.py` | verbatim match |
+| box size, median | 6 × 7 × 4 voxels |
+| boxes exceeding the 64×64×32 crop | 6 of 5392 |
+| nodules per (patient, lobe) | median 1, p90 3, p99 7, max 26 |
+| (patient, lobe) pairs above 8 nodules | 15 of 3144 |
+
+The last two rows confirm §2's sizing independently. The boxes were also checked
+functionally rather than structurally: nodule boxes separate from **random same-size boxes
+drawn in the same lobe** at **AUC 0.837 on mean HU alone**, which a wrong mapping could
+not produce. That number is also the oracle upper bound quoted in §9.
 
 ---
 
@@ -276,6 +310,61 @@ alone would have closed the gap.
 
 ---
 
+## 9. What the probes actually measured
+
+Run on `checkpoint-1390`, val split, 142 patients / 710 lobes, 44.5% of lobes containing
+at least one nodule. Probes are cross-validated with GroupKFold on patient, and every CI
+bootstraps **patients** rather than rows — the five lobes of one patient are not
+independent, and resampling rows would make each interval about √5 too narrow.
+
+| representation | AUC | 95% CI |
+|---|---|---|
+| prior | 0.500 | — |
+| `mask_token` | 0.542 | [0.503, 0.585] |
+| patch tokens, MIL top-k | 0.560 | [0.516, 0.605] |
+| **`lobe_voxels` (lobe size alone)** | **0.561** | [0.523, 0.601] |
+| patch tokens, MIL max | 0.587 | [0.546, 0.627] |
+| voxel stats, native resolution | 0.597 | [0.558, 0.638] |
+| **`post_fc` (what the LLM sees)** | 0.598 | [0.558, 0.639] |
+| voxel stats, after resize | 0.599 | [0.560, 0.638] |
+| `post_perceiver` | 0.590 | [0.550, 0.630] |
+| `pre_perceiver` (pooled patches) | 0.611 | [0.571, 0.653] |
+| **oracle: lesion box vs random box, mean HU** | **0.837** | — |
+
+Paired comparisons, same patients resampled for both arms:
+
+| comparison | delta | verdict |
+|---|---|---|
+| `post_fc` − `lobe_voxels` | +0.038 [−0.009, +0.084] | not resolved |
+| `pre_perceiver` − `post_perceiver` | +0.022 [−0.002, +0.045] | not resolved |
+| voxel native − voxel resized | −0.002 [−0.035, +0.033] | no difference |
+| `pre_perceiver` − `lobe_voxels` | +0.051 [+0.004, +0.097] | resolved, barely |
+
+Nodule **count** and **max diameter** are at Spearman ρ ≤ 0.11 everywhere, which is the
+measured version of §6's observation that predicted sizes never exceed 16 mm while the
+ground truth reaches 55 mm.
+
+Three hypotheses died here, and they are worth recording so nobody re-runs them:
+
+- **the 32-latent resampler is the bottleneck** — no. pre − post is inside the noise.
+- **the resize destroys it** — no. Native-resolution voxel statistics score the same as
+  post-resize ones. This also means the B1 ablation is not the load-bearing control it
+  was designed to be.
+- **the pooling in the probe was hiding it** — no. MIL over unpooled patch tokens, which
+  scores each patch and takes the best, does not beat mean/max pooling (0.587 vs 0.611).
+
+What survives is simpler and better supported: at lobe granularity the signal-to-noise
+ratio is hopeless regardless of representation, and cropping to the lesion fixes it.
+
+**Caveat that must stay attached to the 0.837.** It uses ground-truth nodule locations.
+It is an oracle-localisation upper bound, not a deployable number, and the ablation table
+in §7 still owes an arm that says where lesion boxes come from at inference time.
+
+Reproduce with `evaluation/extract_region_features.py`, `extract_voxel_features.py`,
+`probe_local_info.py`, and `probe_mil.py`.
+
+---
+
 ## 8. Implementation status (repo side)
 
 §1–§4 are implemented: `regions.py` (`MAX_LESION_PER_REGION`, `lesion_token_names`),
@@ -284,20 +373,33 @@ alone would have closed the gap.
 `forward`/`generate` signatures, both `radgenome_dataset_{train,test}.py`, and the
 `train_radgenome.py` / `test_radgenome.py` collators.
 
-**Everything here is a no-op today.** No `nodules.nii.gz` exists anywhere yet (see
-`HANDOFF_TO_LOCAL.md`), so every sample takes the empty-lesion path — verified with
-synthetic (non-repo) smoke tests: `LesionEncoder` on a zero-length batch, the scatter-index
-math in `MyEmbedding.forward` against a hand-built batch with 0/mixed/full lesion counts,
-`lesion_token_names(5)` as an exact prefix of `lesion_token_names(10)` (same reasoning as
-the existing `max_region_size` mismatch between `Reg2RG`'s default of 10 and the Dataset
-classes' default of 5), and `text_add_region_tokens` producing byte-identical output to
-before this change when `lesion_tokens_per_slot` is empty. None of this touched real
-patient data — no `nodules.nii.gz` exists to test against.
+**Lesion tokens are off by default and must be switched on explicitly.** The dataset takes
+`nodule_metadata=None` unless a path is passed, so B0 and B2 differ by exactly one
+argument from one checkout:
 
-**Deviates from §2 in one place:** overflow ranking (top `MAX_LESION_PER_REGION` per lobe)
-currently sorts by instance-mask voxel count, not `tw_lung_rads` desc / `eq_diam_mm` desc.
-`nodule_metadata.csv` isn't joinable to the instance mask's integer nodule ids yet — fix
-this once §5 lands (both are flagged inline in `radgenome_dataset_{train,test}.py`).
+```bash
+# B0 baseline (also what an in-flight seed sweep keeps producing)
+bash train_radgenome.sh ncku_a100
+# B2 lesion arm
+nodule_metadata=$DATA_ROOT/nodule_metadata.csv bash train_radgenome.sh ncku_a100
+```
+
+Defaulting to off is not just tidiness: the seed sweep runs its seeds sequentially in
+fresh processes, so a default that read the metadata would have flipped seeds 2 and 3 to
+a different arm mid-sweep and quietly destroyed the noise floor.
+
+Inference must use the same setting as training. A lesion-trained checkpoint evaluated
+without it leaves every `<lesion*>` id pointing at a zero row, and nothing raises.
+
+Verified on real volumes: 3144 (volume, region) pairs indexed, the 8-slot cap respected,
+every crop `(64, 64, 32)`, and 100% of crop centres denser than the surrounding
+parenchyma (median +87 HU, p10 +29). Shape and scatter-index behaviour were checked
+separately against `MyEmbedding` with synthetic tensors — including a zero-length batch,
+mixed lesion counts, `lesion_token_names(5)` as an exact prefix of `lesion_token_names(10)`,
+and `text_add_region_tokens` producing byte-identical output when no lesions are present.
+
+§2's ranking (`tw_lung_rads` desc, then `eq_diam_mm` desc) is implemented as specified;
+the earlier voxel-count stand-in is gone now that the metadata is the source.
 
 **Not implemented:** §6 (auxiliary count/diameter head) — explicitly deferred until after
 §4 trains — and §7's B1/B3/B4 ablation arms, which are training runs, not repo changes.

@@ -1,85 +1,99 @@
-"""Pure-array helpers for lesion-token cropping (docs/LESION_TOKENS.md).
+"""Lesion crops for the lesion-token pathway (docs/LESION_TOKENS.md).
 
-Kept out of the two Dataset classes for the same reason regions.py is: this is
-exactly the kind of logic where a train/test mismatch wouldn't raise, it would
-just silently misassign a nodule's crop to the wrong lobe or the wrong slot.
+Reads nodule bounding boxes straight out of nodule_metadata.csv. That CSV already
+carries `crop_y0/x0/z0` and precomputed `y0_crop..z1_crop`, i.e. boxes in the same
+cropped frame as the exported NIfTI, so the instance mask that §5 of the design
+doc asks the workstation to produce is not needed -- the note there predates
+those columns. Verified against the exported volumes: crop_h/w/d matches the
+image shape, and nodule boxes separate from random same-size boxes drawn in the
+same lobe at AUC 0.837 on mean HU alone, which random boxes could not do if the
+mapping were wrong.
 
-Expects a nodule *instance* mask (`masks/seg_<folder>/nodules.nii.gz`, uint,
-0 = background, 1..N = nodule id) living in the same crop frame as the per-region
-lobe masks and the image itself — verified against data_prep/export_reg2rg.py,
-which crops the image and every region mask with one shared slice out of the same
-npy grid, so an instance mask exported the same way needs no separate origin
-bookkeeping (docs/LESION_TOKENS.md §5).
+That 0.837 is also the reason this pathway exists. Every lobe-level
+representation measured -- ViT patch tokens, perceiver latents, what the LLM
+sees, and model-free voxel statistics at native resolution -- sits between 0.54
+and 0.61 AUC for "does this lobe contain a nodule", indistinguishable from just
+knowing how big the lobe is. A 5 mm nodule is ~65 voxels in a ~4 M voxel lobe, so
+no pooled summary can hold it. Cropping to the lesion is what recovers it.
 
-None of this has run against a real nodules.nii.gz yet — none exist on disk as of
-writing (see HANDOFF_TO_LOCAL.md). It's written directly against the documented
-contract rather than a throwaway stub; re-validate the first time real instance
-masks land.
+NOTE: lesion crops are keyed on ground-truth annotations. That makes this an
+oracle-localisation setting, not a deployable pipeline -- see docs/LESION_TOKENS.md.
 """
 import numpy as np
+import pandas as pd
 
 LESION_CROP_SIZE = (64, 64, 32)
 
-
-def instance_bboxes(instance_mask):
-    """nodule id (1..N) -> half-open voxel bbox (y0, y1, x0, x1, z0, z1)."""
-    boxes = {}
-    for nid in np.unique(instance_mask):
-        nid = int(nid)
-        if nid == 0:
-            continue
-        ys, xs, zs = np.nonzero(instance_mask == nid)
-        boxes[nid] = (int(ys.min()), int(ys.max()) + 1,
-                      int(xs.min()), int(xs.max()) + 1,
-                      int(zs.min()), int(zs.max()) + 1)
-    return boxes
+# Boxes are tiny -- median 6x7x4 voxels, and only 6 of 5392 exceed LESION_CROP_SIZE.
+BBOX_COLS = ['y0_crop', 'y1_crop', 'x0_crop', 'x1_crop', 'z0_crop', 'z1_crop']
 
 
-def nodules_by_region(instance_mask, region_masks):
-    """nodule id -> region key, assigned by max voxel overlap with each region mask.
+def load_nodule_index(csv_path, max_per_region=None):
+    """(Volumename, region) -> nodule records, best first.
 
-    `region_masks` is {region_key: binary array, same shape as instance_mask}.
-    A nodule with no overlap against any region mask (shouldn't happen if the
-    nodule truly sits inside a segmented lobe, but real segmentations have edge
-    cases) is left unassigned rather than guessed at.
+    Ranked by tw_lung_rads then eq_diam_mm, both descending, per
+    docs/LESION_TOKENS.md §2: when a lobe holds more nodules than there are slots,
+    the ones kept should be the ones a radiologist would lead with. Only 15 of
+    3144 (patient, lobe) pairs have more than 8, so this rarely bites -- and the
+    lobe's report text still describes every nodule either way, so overflow costs
+    visual detail, never a training target.
     """
-    assignment = {}
-    for nid in np.unique(instance_mask):
-        nid = int(nid)
-        if nid == 0:
-            continue
-        nodule_voxels = instance_mask == nid
-        best_region, best_overlap = None, 0
-        for region, mask in region_masks.items():
-            overlap = int(np.count_nonzero(nodule_voxels & (mask > 0)))
-            if overlap > best_overlap:
-                best_region, best_overlap = region, overlap
-        if best_region is not None:
-            assignment[nid] = best_region
-    return assignment
+    df = pd.read_csv(csv_path)
+
+    missing = [c for c in BBOX_COLS + ['Volumename', 'region'] if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f'{csv_path} is missing {missing}. Expected the cropped-frame boxes '
+            f'(available: {list(df.columns)})')
+
+    df = df.dropna(subset=BBOX_COLS)
+    for c in ('tw_lung_rads', 'eq_diam_mm'):
+        if c not in df.columns:
+            df[c] = 0.0
+    df = df.sort_values(['tw_lung_rads', 'eq_diam_mm'], ascending=False)
+
+    index = {}
+    for (vol, region), grp in df.groupby(['Volumename', 'region'], sort=False):
+        if max_per_region is not None:
+            grp = grp.head(max_per_region)
+        index[(str(vol), str(region))] = [
+            (int(r.y0_crop), int(r.y1_crop), int(r.x0_crop),
+             int(r.x1_crop), int(r.z0_crop), int(r.z1_crop))
+            for r in grp.itertuples()
+        ]
+    return index
 
 
 def crop_lesion(img, bbox, size=LESION_CROP_SIZE):
-    """Crop `img` at `bbox`, centre-aligned into a fixed-size zero-padded array.
+    """Crop `img` at `bbox`, centred in a fixed-size zero-padded array.
 
-    No resize (docs/LESION_TOKENS.md §2 — resizing is exactly what destroys the
-    signal at the lobe level). Bigger-than-`size` bboxes are centre-cropped, not
-    downsampled; this only bites the rare bbox that exceeds 64x64x32 at native
-    (0.8, 0.8, 1.0) mm resolution, i.e. a lesion well past what the RUL/RML recall
-    problem in HANDOFF.md §6 is about.
+    No resize: downsampling here would reintroduce exactly the scale loss the
+    lobe-level pathway already suffers from. A box larger than `size` is
+    centre-cropped rather than shrunk, which affects 6 nodules in 5392.
     """
     y0, y1, x0, x1, z0, z1 = bbox
-    crop = img[y0:y1, x0:x1, z0:z1]
+    y0, x0, z0 = max(y0, 0), max(x0, 0), max(z0, 0)
+    y1 = min(y1, img.shape[0])
+    x1 = min(x1, img.shape[1])
+    z1 = min(z1, img.shape[2])
+    if y0 >= y1 or x0 >= x1 or z0 >= z1:
+        return np.zeros(size, dtype=np.float32)
+
     ty, tx, tz = size
-    sy, sx, sz = crop.shape
+    # widen a tiny box out to the crop window so the encoder sees context, not
+    # just the lesion's own voxels
+    cy, cx, cz = (y0 + y1) // 2, (x0 + x1) // 2, (z0 + z1) // 2
+    wy0 = int(np.clip(cy - ty // 2, 0, max(img.shape[0] - ty, 0)))
+    wx0 = int(np.clip(cx - tx // 2, 0, max(img.shape[1] - tx, 0)))
+    wz0 = int(np.clip(cz - tz // 2, 0, max(img.shape[2] - tz, 0)))
+    crop = img[wy0:wy0 + ty, wx0:wx0 + tx, wz0:wz0 + tz]
 
-    cy0 = max((sy - ty) // 2, 0)
-    cx0 = max((sx - tx) // 2, 0)
-    cz0 = max((sz - tz) // 2, 0)
-    crop = crop[cy0:cy0 + ty, cx0:cx0 + tx, cz0:cz0 + tz]
-
-    out = np.zeros(size, dtype=crop.dtype)
-    oy, ox, oz = crop.shape
-    py0, px0, pz0 = (ty - oy) // 2, (tx - ox) // 2, (tz - oz) // 2
-    out[py0:py0 + oy, px0:px0 + ox, pz0:pz0 + oz] = crop
+    out = np.zeros(size, dtype=np.float32)
+    out[:crop.shape[0], :crop.shape[1], :crop.shape[2]] = crop
     return out
+
+
+def normalize_lesion(crop, hu_min=-1000.0, hu_max=200.0):
+    """Same HU window and scaling the region pathway applies to lobe volumes."""
+    crop = np.clip(crop, hu_min, hu_max)
+    return ((crop + 400.0) / 600.0).astype(np.float32)

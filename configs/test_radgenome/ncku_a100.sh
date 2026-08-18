@@ -37,6 +37,11 @@ data_folder="$DATA_ROOT/images"
 mask_folder="$DATA_ROOT/masks"
 report_file="$DATA_ROOT/region_report_${split}.csv"
 
+# Must match the checkpoint's training arm. Evaluating a lesion-trained model with
+# this empty leaves every <lesion*> id pointing at a zero embedding, and nothing
+# raises -- the reports just quietly get worse.
+nodule_metadata="${nodule_metadata:-}"
+
 # Results — tagged by split, checkpoint, and run_tag so runs do not overwrite (or
 # get silently skipped against) each other. test_radgenome.py appends and skips
 # AccNums already present, so reusing one filename across genuinely different

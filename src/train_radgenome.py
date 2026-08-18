@@ -123,6 +123,7 @@ def main():
         mask_folder=data_args.mask_folder,
         csv_file=data_args.report_file,
         cache_dir=data_args.monai_cache_dir,
+        nodule_metadata=data_args.nodule_metadata or None,
     )
 
     print("Setup Model")

@@ -21,4 +21,8 @@ class DataArguments:
     mask_folder: Optional[str] = field(default='/jhcnas5/chenzhixuan/data/RadGenome-ChestCT/dataset/valid_region_mask')
     report_file: Optional[str] = field(default='/jhcnas5/chenzhixuan/data/RadGenome-ChestCT/dataset/radgenome_files/validation_region_report.csv')
     monai_cache_dir: Optional[str] = field(default='/jhcnas5/chenzhixuan/data/RadGenome-ChestCT/cache')
+    # Must match what the checkpoint was trained with: a model trained with lesion
+    # tokens and evaluated without them (or the reverse) gets a prompt whose
+    # <lesion*> ids point at zero embeddings, and nothing raises.
+    nodule_metadata: Optional[str] = field(default='')
     result_path: Optional[str] = field(default='/home/chenzhixuan/Workspace/Reg2RG/results/radgenome_combined_reports.csv')

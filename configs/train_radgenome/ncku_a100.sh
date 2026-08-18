@@ -36,6 +36,13 @@ mask_folder="$DATA_ROOT/masks"
 report_file="$DATA_ROOT/region_report_train.csv"
 monai_cache_dir="$DATA_ROOT/cache" # useless
 
+# Lesion tokens (docs/LESION_TOKENS.md). Empty = off = the B0 baseline, which is
+# what the seed sweep is measuring; the default must stay empty so a sweep already
+# in flight keeps producing baseline runs. Enable the B2 arm per run with:
+#   nodule_metadata=$DATA_ROOT/nodule_metadata.csv bash train_radgenome.sh ncku_a100
+# Boxes come straight from that CSV's *_crop columns -- no nodules.nii.gz needed.
+nodule_metadata="${nodule_metadata:-}"
+
 # Outputs — inside the project directory, one directory per seed.
 # HF Trainer's _rotate_checkpoints sorts by mtime, not by step, so a second run
 # writing into an existing output_dir deletes the earlier run's checkpoints once
