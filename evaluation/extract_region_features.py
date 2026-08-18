@@ -73,7 +73,7 @@ def build_encoder(ckpt_path, device, dtype):
 
 
 @torch.no_grad()
-def region_taps(model, region_volume, mask_volume, device, dtype):
+def region_taps(model, region_volume, mask_volume, device, dtype, keep_patch_tokens=False):
     """One region -> pooled features at each tap point.
 
     Mirrors the region loop in MyEmbedding.forward exactly; if that changes, this
@@ -104,13 +104,22 @@ def region_taps(model, region_volume, mask_volume, device, dtype):
         t = t.reshape(-1, t.shape[-1]).float()
         return torch.cat([t.mean(0), t.amax(0)]).cpu().numpy().astype(np.float16)
 
-    return {
+    out = {
         'pre_perceiver': pooled(pre),
         'post_perceiver': pooled(post),
         'post_fc': pooled(fc_out),
         'mask_token': mask_emb.reshape(-1).float().cpu().numpy().astype(np.float16),
         'n_patches': int(pre.shape[-2]),
     }
+    if keep_patch_tokens:
+        # Unpooled ViT tokens, for the MIL probe. Mean/max pooling is exactly the
+        # wrong summary for "is there a nodule somewhere in here": a lesion under
+        # one patch in 1024 is diluted ~1000x by the mean, and survives the max
+        # only if it happens to dominate a dimension. Keeping the tokens lets the
+        # probe score patches individually and take the best one, which is the
+        # question actually being asked.
+        out['patch_tokens'] = pre.reshape(-1, pre.shape[-1]).float().cpu().numpy().astype(np.float16)
+    return out
 
 
 def main():
@@ -126,6 +135,11 @@ def main():
     ap.add_argument('--cache_dir', default=None,
                     help='MONAI cache dir. Defaults inside the repo so this never '
                          'writes to the shared clinical data volume, which we only read.')
+    ap.add_argument('--patch_tokens_out', default=None,
+                    help='Also write unpooled ViT patch tokens here as .npy, for the '
+                         'MIL probe. ~1.6 MB per region row (1024x768 fp16), i.e. ~1.1 GB '
+                         'for val and ~8.8 GB for train, held in RAM until the final '
+                         'stack -- use on val unless you have checked the headroom.')
     a = ap.parse_args()
 
     cache_dir = a.cache_dir or os.path.join(
@@ -170,7 +184,8 @@ def main():
         for region in REGIONS:
             if region not in vision_x:
                 continue
-            taps = region_taps(model, vision_x[region], mask_x[region], device, dtype)
+            taps = region_taps(model, vision_x[region], mask_x[region], device, dtype,
+                               keep_patch_tokens=bool(a.patch_tokens_out))
             rows.append({
                 'acc_num': acc,
                 'region': region,
@@ -195,6 +210,13 @@ def main():
     print(f'wrote {a.out}: {len(rows)} region rows')
     for tap in ('pre_perceiver', 'post_perceiver', 'post_fc'):
         print(f'  {tap}: {out[tap].shape}')
+
+    if a.patch_tokens_out:
+        # Plain .npy, not npz: the MIL probe memory-maps this rather than loading
+        # several GB at once, and np.load(mmap_mode=...) does not work on npz.
+        toks = np.stack([r['patch_tokens'] for r in rows])
+        np.save(a.patch_tokens_out, toks)
+        print(f'wrote {a.patch_tokens_out}: {toks.shape} ({toks.nbytes / 1e9:.2f} GB)')
 
 
 if __name__ == '__main__':

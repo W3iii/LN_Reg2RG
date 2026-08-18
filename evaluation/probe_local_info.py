@@ -114,10 +114,32 @@ def assemble(npz_path, counts, diams):
     return feats, acc, n, dm
 
 
+def bootstrap_auc_ci(y, scores, groups, n_boot=2000, seed=0):
+    """Percentile CI for AUC, resampling *patients* rather than rows.
+
+    Resampling rows would treat the five lobes of one patient as independent and
+    give a CI roughly sqrt(5) too narrow -- which is how a 0.02 AUC gap between
+    two tap points gets mistaken for a finding.
+    """
+    rng = np.random.default_rng(seed)
+    uniq = np.unique(groups)
+    idx_by_group = {g: np.flatnonzero(groups == g) for g in uniq}
+    out = []
+    for _ in range(n_boot):
+        pick = rng.choice(uniq, size=len(uniq), replace=True)
+        idx = np.concatenate([idx_by_group[g] for g in pick])
+        if len(np.unique(y[idx])) < 2:
+            continue
+        out.append(roc_auc_score(y[idx], scores[idx]))
+    if not out:
+        return float('nan'), float('nan')
+    return float(np.percentile(out, 2.5)), float(np.percentile(out, 97.5))
+
+
 def cv_binary(X, y, groups, n_splits=5):
-    """Out-of-fold AUC for 'this lobe contains >=1 nodule'."""
+    """Out-of-fold AUC for 'this lobe contains >=1 nodule', with a bootstrap CI."""
     if len(np.unique(y)) < 2:
-        return float('nan')
+        return float('nan'), (float('nan'), float('nan')), np.zeros(len(y))
     oof = np.zeros(len(y))
     cv = GroupKFold(n_splits=n_splits)
     for tr, te in cv.split(X, y, groups):
@@ -134,7 +156,29 @@ def cv_binary(X, y, groups, n_splits=5):
         )
         gs.fit(X[tr], y[tr])
         oof[te] = gs.best_estimator_.predict_proba(X[te])[:, 1]
-    return roc_auc_score(y, oof)
+    return roc_auc_score(y, oof), bootstrap_auc_ci(y, oof, groups), oof
+
+
+def paired_delta_ci(y, s_a, s_b, groups, n_boot=2000, seed=0):
+    """CI on AUC(a) - AUC(b), bootstrapping the same patients for both.
+
+    Pairing matters: two feature sets scored on identical folds share most of
+    their error, so independent CIs on each overlap heavily even when the
+    difference is consistent -- and vice versa.
+    """
+    rng = np.random.default_rng(seed)
+    uniq = np.unique(groups)
+    idx_by_group = {g: np.flatnonzero(groups == g) for g in uniq}
+    out = []
+    for _ in range(n_boot):
+        pick = rng.choice(uniq, size=len(uniq), replace=True)
+        idx = np.concatenate([idx_by_group[g] for g in pick])
+        if len(np.unique(y[idx])) < 2:
+            continue
+        out.append(roc_auc_score(y[idx], s_a[idx]) - roc_auc_score(y[idx], s_b[idx]))
+    if not out:
+        return float('nan'), float('nan')
+    return float(np.percentile(out, 2.5)), float(np.percentile(out, 97.5))
 
 
 def cv_regression(X, y, groups, n_splits=5):
@@ -174,14 +218,34 @@ def main():
     print(f'\nregion rows: {len(has)}   with >=1 nodule: {has.sum()} ({has.mean():.1%})')
     print(f'patients: {len(np.unique(acc))}   folds: {a.folds} (grouped by patient)')
 
-    print('\n' + '=' * 62)
+    print('\n' + '=' * 70)
     print('does this lobe contain a nodule?   (out-of-fold AUC, 0.5 = chance)')
-    print('=' * 62)
-    print(f'{"prior":<18}{0.5:>10.3f}')
-    auc = {}
+    print('95% CI bootstraps patients, not rows -- lobes within a patient are not')
+    print('independent, and ignoring that makes every CI ~sqrt(5) too narrow.')
+    print('=' * 70)
+    print(f'{"prior":<18}{0.5:>8.3f}')
+    auc, oof = {}, {}
     for name in FEATURE_SETS:
-        auc[name] = cv_binary(feats[name], has, acc, a.folds)
-        print(f'{name:<18}{auc[name]:>10.3f}   dim={feats[name].shape[1]}')
+        auc[name], ci, oof[name] = cv_binary(feats[name], has, acc, a.folds)
+        print(f'{name:<18}{auc[name]:>8.3f}  [{ci[0]:.3f}, {ci[1]:.3f}]   dim={feats[name].shape[1]}')
+
+    print('\n' + '-' * 70)
+    print('paired differences that decide the story  (95% CI, same patients both arms)')
+    print('-' * 70)
+    for a_name, b_name, question in [
+        ('pre_perceiver', 'post_perceiver',
+         'is the 32-latent resampler where it dies?'),
+        ('pre_perceiver', 'lobe_voxels',
+         'do ViT patches beat just knowing lobe size?'),
+        ('post_fc', 'lobe_voxels',
+         'does what the LLM sees beat lobe size?'),
+    ]:
+        lo, hi = paired_delta_ci(has, oof[a_name], oof[b_name], acc)
+        d = auc[a_name] - auc[b_name]
+        verdict = 'CI excludes 0' if (lo > 0 or hi < 0) else 'CI includes 0 -- not resolved'
+        print(f'{a_name} - {b_name}')
+        print(f'    {question}')
+        print(f'    delta {d:+.3f}  [{lo:+.3f}, {hi:+.3f}]   {verdict}')
 
     print('\n' + '=' * 62)
     print('how many nodules / how big?   (out-of-fold Spearman rho)')
