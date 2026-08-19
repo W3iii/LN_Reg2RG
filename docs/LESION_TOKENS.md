@@ -296,17 +296,30 @@ delta.
 | B3 | B2 + auxiliary count/diameter head | does explicit supervision help retention? |
 | B4 | B2 with fixed-K Perceiver pooling over lesions | bounded token budget for unbounded nodule count |
 
-**Primary metric:** per-lobe finding precision/recall from
-`evaluation/analyze_region_predictions.py`, with **RML and RUL recall** as the headline —
-those are the lobes the baseline essentially never predicts. A clean result is RML/RUL
-recall rising while the normal-region behaviour stays put.
+**Primary metric: the representation probe** (`probe_local_info.py`) — `post_fc` AUC
+against the `lobe_voxels` control, with a paired patient-level CI, plus the count/diameter
+correlations.
 
-**Secondary:** NLG metrics computed over findings-only regions. Do not report NLG averaged
+This displaced the text metric on evidence, not preference. Across three seeds of one
+unchanged config (`HANDOFF.md` §11) the probe moved **0.003** while micro-F1 moved
+**0.252**: 0.019, 0.271, 0.178 from models whose representations are indistinguishable.
+One seed per arm therefore suffices here, and the residual uncertainty is patient
+sampling, which the paired CI addresses — roughly 34 GPU-hours across these five arms
+instead of 112.
+
+**Secondary:** per-lobe finding precision/recall from `analyze_region_predictions.py`,
+RML and RUL recall as the headline, **always reported with the fraction of lobes called
+abnormal**. Without that column an operating-point shift is indistinguishable from a real
+gain — seed 1 above called 1.0% of lobes abnormal against seed 2's 18.6%, and that alone
+accounts for most of the F1 gap.
+
+**Also secondary:** NLG metrics over findings-only regions. Do not report NLG averaged
 across all regions: 56% of targets are `No significant finding.`, so that average mostly
 measures how often the model says nothing.
 
-B1 matters for the write-up. Without it a reviewer will ask whether the resize schedule
-alone would have closed the gap.
+B1 is now a formality rather than a load-bearing control — §9 shows native-resolution
+voxel statistics score the same as post-resize ones, so the resize schedule was never the
+mechanism. Keep it only if a reviewer would otherwise ask.
 
 ---
 

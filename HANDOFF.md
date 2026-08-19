@@ -27,7 +27,7 @@ Fork: `git@github.com:W3iii/LN_Reg2RG.git` (upstream `zhi-xuan-chen/Reg2RG`).
 | Exact per-lobe metrics | done — [§6](#6-what-the-trained-model-actually-does) |
 | Probing where local information is lost | done — [`docs/LESION_TOKENS.md`](docs/LESION_TOKENS.md) §9; three candidate mechanisms rejected |
 | Lesion tokens (§7 route 2), repo-side | done and runnable — boxes come from `nodule_metadata.csv`, no workstation dependency. Off by default; enable with `nodule_metadata=` |
-| Baseline noise floor (3 seeds) | in progress — needed before any B0-vs-B2 comparison can be read |
+| Baseline noise floor (3 seeds) | done — [§11](#11-the-noise-floor-and-which-metric-to-trust). Text metrics swing 14×; the probe does not move |
 
 ---
 
@@ -475,3 +475,59 @@ the curves are still there for ablation comparisons.
 Config knobs live in `configs/{train,test}_radgenome/ncku_a100.sh`. `DATA_ROOT` is
 absolute; `CKPT_ROOT` and all outputs derive from `REPO_ROOT`, which the config resolves
 from its own location — so the checkout can move without edits.
+
+Sweeps:
+
+```bash
+cd scripts
+bash run_seed_sweep.sh ncku_a100 1 2 3   # baseline, one seed at a time, ~4.5 h each
+bash probe_seeds.sh 1 2 3                # representation probe per checkpoint, ~10 min each
+bash infer_seeds.sh 1 2 3                # inference + region diagnostic, ~20 min each
+
+# lesion arm (B2) — one argument away from the baseline
+nodule_metadata=$DATA_ROOT/nodule_metadata.csv bash train_radgenome.sh ncku_a100
+```
+
+---
+
+## 11. The noise floor, and which metric to trust
+
+Three seeds of the identical baseline config, all with lesion tokens off, evaluated on the
+same 142 val patients.
+
+| | seed 1 | seed 2 | seed 3 | range |
+|---|---|---|---|---|
+| final `train_loss` | 0.444 | 0.474 | 0.455 | 0.030 |
+| **probe AUC (`post_fc`)** | 0.593 | 0.594 | 0.591 | **0.003** |
+| **text micro-F1** | **0.019** | 0.271 | 0.178 | **0.252** |
+| lobes reported as abnormal | 1.0% | 18.6% | 14.8% | (truth: 44.5%) |
+
+With the two earlier runs, micro-F1 has now been observed at 0.019, 0.178, 0.235, 0.271
+and 0.439 — a coefficient of variation near 66% on a config that never changed.
+
+**The three models are the same model.** Their representations are indistinguishable, and
+their training losses sit within 0.03. What differs is how readily the decoder commits to
+saying something: seed 1 collapsed onto "No significant finding" for 99% of lobes, which
+is a competitive strategy when 55% of the targets say exactly that, and its reports are
+well-formed and useless. Text F1 is therefore mostly reading the model's *reporting
+threshold*, not whether it can see a nodule.
+
+Two free correctness checks fell out of this: `lobe_voxels` scored identically across all
+three seeds (it is a property of the data), and so did `pre_perceiver` (0.611 every time)
+— which is what a genuinely frozen ViT3D should do, and confirms the extraction is
+deterministic.
+
+### Consequences
+
+1. **Every per-lobe number in [§6](#6-what-the-trained-model-actually-does) is one draw
+   from this distribution.** The RUL recall of 0.043 that motivated the whole
+   investigation reads 0.072 on seed 2 and 0.116 on seed 3. Treat those figures as
+   illustrative, not as the model's properties.
+2. **Make the probe the primary metric.** Seed noise on it is 0.003 against 0.252 for
+   text, so one seed per arm suffices and the remaining uncertainty is patient sampling,
+   which a paired CI handles directly. Costed over the five arms in §7, that is roughly
+   34 GPU-hours instead of 112.
+3. **Never report text metrics without the reporting rate beside them.** 0.019 versus
+   0.271 looks like a model difference and is an operating-point difference.
+4. Keep text metrics as secondary evidence on the two or three arms that reach the
+   write-up, with enough seeds to put an honest error bar on them.
