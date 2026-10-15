@@ -1,6 +1,11 @@
 
 # Experiment settings — NCKU ME dataset, 5 pulmonary lobes as regions
-experiment_name="Reg2RG_ncku_lobe5"
+#
+# Overridable so an ablation arm gets its own output_dir at the *same* seed --
+# B0 seed 1 and B2 seed 1 must not share a directory, or HF Trainer's mtime-based
+# checkpoint rotation deletes one arm's weights while the other trains.
+#   experiment_name=Reg2RG_ncku_lobe5_lesion seed=1 nodule_metadata=... bash train_radgenome.sh ncku_a100
+experiment_name="${experiment_name:-Reg2RG_ncku_lobe5}"
 bf16=True
 
 # Random seed. Two runs of this config that were architecturally identical scored
