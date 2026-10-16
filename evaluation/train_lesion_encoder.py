@@ -54,10 +54,10 @@ from extract_lesion_features import find_image                    # noqa: E402
 
 
 # ------------------------------------------------------------------ data
-def build_cache(data_root, meta_csv, cache):
+def build_cache(data_root, meta_csv, cache, splits=('train', 'val')):
     import nibabel as nib
     nm = pd.read_csv(meta_csv)
-    nm = nm[nm['split'].isin(['train', 'val'])].dropna(subset=BBOX_COLS + ['eq_diam_mm', 'tw_lung_rads'])
+    nm = nm[nm['split'].isin(list(splits))].dropna(subset=BBOX_COLS + ['eq_diam_mm', 'tw_lung_rads'])
     nm = nm.reset_index(drop=True)
     X = np.zeros((len(nm), 64, 64, 32), dtype=np.float16)
     t0 = time.time()
@@ -71,7 +71,8 @@ def build_cache(data_root, meta_csv, cache):
             print(f'  cache {vi+1}/{len(vols)} volumes {time.time()-t0:.0f}s', flush=True)
     os.makedirs(os.path.dirname(os.path.abspath(cache)), exist_ok=True)
     np.save(cache, X)
-    nm[['pid', 'Volumename', 'split', 'nodule_id', 'eq_diam_mm', 'tw_lung_rads']].to_csv(cache + '.csv', index=False)
+    keep = [c for c in ('pid', 'Volumename', 'split', 'nodule_id', 'region', 'lobe', 'eq_diam_mm', 'tw_lung_rads') if c in nm.columns]
+    nm[keep].to_csv(cache + '.csv', index=False)
     print(f'wrote {cache} {X.shape} ({X.nbytes/1e9:.2f} GB)')
 
 
@@ -183,6 +184,7 @@ def main():
         if score > best_score:
             best_score, best = score, m
             torch.save({'arch': a.arch, 'encoder': model.enc.state_dict(),
+                        'size_head': model.size_head.state_dict(), 'rads_head': model.rads_head.state_dict(),
                         'metrics': {k: float(v) for k, v in m.items()}}, os.path.join(out, 'best.pt'))
             flag = ' *'
         print(f'ep {ep+1:3d} loss {m["train_loss"]:.3f} | val rho {m["rho"]:.3f} MAE(>=6) {m["MAE_ge6"]:.2f} '
