@@ -21,7 +21,7 @@ exact functions the Dataset uses (lesion_utils.crop_lesion / normalize_lesion) o
 the NIfTI array as nibabel returns it, which is what the Dataset does too.
 
 Taps per nodule:
-    pre_fc     pooled conv features before the projection   (width*4,)  = 128
+    pre_fc     pooled conv features before the projection   (128 gap, 256 center/attn)
     post_fc    the lesion token the LLM sees                (4096,)
     intensity  model-free crop statistics (HU means / dense-voxel fractions in
                nested windows around the box centre) -- a reference for how much
@@ -45,16 +45,16 @@ import nibabel as nib
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
 
-from Model.my_embedding_layer import LesionEncoder            # noqa: E402
+from Model.my_embedding_layer import build_lesion_encoder as make_encoder, LESION_ARCHS  # noqa: E402
 from lesion_utils import (crop_lesion, normalize_lesion,       # noqa: E402
                           BBOX_COLS, LESION_CROP_SIZE)
 
 PREFIX = 'embedding_layer.lesion_encoder.'
 
 
-def build_lesion_encoder(ckpt_path, random_init, device, dtype, seed=0):
+def build_lesion_encoder(ckpt_path, random_init, device, dtype, arch='gap', seed=0):
     torch.manual_seed(seed)
-    enc = LesionEncoder(dim=4096)
+    enc = make_encoder(arch, 4096)
     if not random_init:
         ckpt = torch.load(ckpt_path, map_location='cpu')
         state = {k[len(PREFIX):]: v for k, v in ckpt.items() if k.startswith(PREFIX)}
@@ -97,6 +97,8 @@ def find_image(data_folder, volumename):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--ckpt', default=None, help='B2 checkpoint pytorch_model.bin')
+    ap.add_argument('--lesion_arch', default='gap', choices=LESION_ARCHS,
+                    help='must match the checkpoint (B2 = gap, B3a = attn/center)')
     ap.add_argument('--random_init', action='store_true',
                     help='control arm: fixed random LesionEncoder weights, no checkpoint')
     ap.add_argument('--data_root', required=True,
@@ -116,9 +118,10 @@ def main():
     dtype = torch.bfloat16 if (device.type == 'cuda' and torch.cuda.is_bf16_supported()) else torch.float32
     print(f'device={device} dtype={dtype}')
 
-    enc = build_lesion_encoder(a.ckpt, a.random_init, device, dtype)
+    enc = build_lesion_encoder(a.ckpt, a.random_init, device, dtype, arch=a.lesion_arch)
     tap = {}
-    enc.pool.register_forward_hook(lambda m, i, o: tap.__setitem__('pre_fc', o.flatten(1)))
+    # input of the final projection = pooled conv features, for every arch
+    enc.fc.register_forward_pre_hook(lambda m, inp: tap.__setitem__('pre_fc', inp[0]))
 
     nm = pd.read_csv(a.nodule_metadata or os.path.join(a.data_root, 'nodule_metadata.csv'))
     splits = [s.strip() for s in a.splits.split(',') if s.strip()]

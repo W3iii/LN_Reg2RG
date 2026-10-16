@@ -48,7 +48,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', 'src'))
 sys.path.insert(0, HERE)
 
-from Model.my_embedding_layer import LesionEncoder               # noqa: E402
+from Model.my_embedding_layer import LesionEncoder, PooledLesionEncoder  # noqa: E402  (single source: MyEmbedding loads these state_dicts)
 from lesion_utils import crop_lesion, normalize_lesion, BBOX_COLS  # noqa: E402
 from extract_lesion_features import find_image                    # noqa: E402
 
@@ -94,50 +94,10 @@ class Crops(torch.utils.data.Dataset):
 
 
 # ------------------------------------------------------------------ models
-def block(c_in, c_out, stride):
-    return nn.Sequential(nn.Conv3d(c_in, c_out, 3, stride=stride, padding=1),
-                         nn.GroupNorm(min(8, c_out), c_out), nn.GELU())
-
-
-class PooledEncoder(nn.Module):
-    """Two stride-2 stages then two stride-1 stages: a 16x16x8 map (3.2 mm/cell
-    in-plane at 0.8 mm voxels) instead of LesionEncoder's 4x4x2, so a ~5 mm
-    nodule still covers a couple of cells when it is pooled."""
-
-    def __init__(self, mode, dim=4096, width=32, sigma=2.0):
-        super().__init__()
-        self.mode = mode
-        self.net = nn.Sequential(block(1, width, 2), block(width, width * 2, 2),
-                                 block(width * 2, width * 4, 1), block(width * 4, width * 4, 1))
-        c = width * 4
-        g = torch.stack(torch.meshgrid(torch.arange(16.), torch.arange(16.), torch.arange(8.), indexing='ij'))
-        centre = torch.tensor([7.5, 7.5, 3.5]).view(3, 1, 1, 1)
-        scale = torch.tensor([1., 1., 2.]).view(3, 1, 1, 1)   # z cells are 2x as thick after the crop's 64x64x32
-        d2 = (((g - centre) * scale) ** 2).sum(0)
-        self.register_buffer('d2', d2)
-        w = torch.exp(-d2 / (2 * sigma ** 2))
-        self.register_buffer('gauss', w / w.sum())
-        if mode == 'attn':
-            self.att = nn.Conv3d(c, 1, 1)
-            self.dist_scale = nn.Parameter(torch.tensor(-0.1))   # learned centre bias
-        self.fc = nn.Linear(2 * c, dim)
-
-    def forward(self, x):
-        f = self.net(x)                                     # (N, C, 16, 16, 8)
-        glob = f.mean((2, 3, 4))
-        if self.mode == 'center':
-            w = self.gauss
-        else:
-            logits = self.att(f)[:, 0] + self.dist_scale * self.d2
-            w = torch.softmax(logits.flatten(1), 1).view_as(logits)
-        loc = (f * w.unsqueeze(1) if w.dim() == 4 else f * w).sum((2, 3, 4))
-        return self.fc(torch.cat([loc, glob], 1))
-
-
 class Net(nn.Module):
     def __init__(self, arch):
         super().__init__()
-        self.enc = LesionEncoder(dim=4096) if arch == 'gap' else PooledEncoder(arch)
+        self.enc = LesionEncoder(dim=4096) if arch == 'gap' else PooledLesionEncoder(arch)
         self.size_head = nn.Sequential(nn.LayerNorm(4096), nn.Linear(4096, 1))
         self.rads_head = nn.Sequential(nn.LayerNorm(4096), nn.Linear(4096, 4))
 
@@ -192,6 +152,7 @@ def main():
 
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'device={device}' + (f' ({torch.cuda.get_device_name(0)})' if device.type == 'cuda' else '  <-- no GPU visible, this will be slow'))
     mk = lambda idx, aug, sh: torch.utils.data.DataLoader(
         Crops(np.asarray(X[idx]), logd[idx], rads[idx], aug),
         batch_size=a.bs, shuffle=sh, num_workers=a.workers, drop_last=sh)
@@ -221,7 +182,8 @@ def main():
         flag = ''
         if score > best_score:
             best_score, best = score, m
-            torch.save({'arch': a.arch, 'encoder': model.enc.state_dict(), 'metrics': m}, os.path.join(out, 'best.pt'))
+            torch.save({'arch': a.arch, 'encoder': model.enc.state_dict(),
+                        'metrics': {k: float(v) for k, v in m.items()}}, os.path.join(out, 'best.pt'))
             flag = ' *'
         print(f'ep {ep+1:3d} loss {m["train_loss"]:.3f} | val rho {m["rho"]:.3f} MAE(>=6) {m["MAE_ge6"]:.2f} '
               f'kappa {m["kappa"]:.3f} AUC>=3 {m["auc_ge3"]:.3f} | {time.time()-t0:.0f}s{flag}', flush=True)

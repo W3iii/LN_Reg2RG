@@ -12,6 +12,10 @@ class ModelArguments:
         default="/jhcnas5/chenzhixuan/MyOpenSource/huggingface/Reg2RG/RadFM_vit3d.pth")
     pretrained_adapter: Optional[str] = field(
         default="/jhcnas5/chenzhixuan/MyOpenSource/huggingface/Reg2RG/RadFM_perceiver_fc.pth")
+    # Lesion encoder (src/Model/my_embedding_layer.py). gap = original B2 encoder.
+    lesion_arch: str = field(default='gap', metadata={'help': 'gap | center | attn'})
+    lesion_encoder_ckpt: Optional[str] = field(default='', metadata={'help': 'best.pt from evaluation/train_lesion_encoder.py'})
+    freeze_lesion_encoder: bool = field(default=False)
 
 @dataclass
 class DataArguments:

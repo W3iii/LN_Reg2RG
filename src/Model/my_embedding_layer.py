@@ -80,8 +80,88 @@ class LesionEncoder(nn.Module):
         return self.fc(x)
 
 
+def _conv_block(c_in, c_out, stride):
+    return nn.Sequential(nn.Conv3d(c_in, c_out, 3, stride=stride, padding=1),
+                         nn.GroupNorm(min(8, c_out), c_out), nn.GELU())
+
+
+class PooledLesionEncoder(nn.Module):
+    """Lesion encoder that keeps spatial resolution and pools around the centre.
+
+    Why it exists (evaluation/train_lesion_encoder.py, val, 142 patients):
+    LesionEncoder's global average pool over the 64x64x32 crop dilutes a nodule
+    that fills <0.2% of it -- the B2 token probed at size rho 0.175, no better
+    than a random encoder. Trained alone on size + TW_Lung_RADS, the same convs
+    reach rho 0.69 with the global pool, 0.79 with `center` and 0.81 with `attn`
+    (RADS kappa 0.55 / 0.67 / 0.69; mask-derived size alone gives 0.68).
+
+    Two stride-2 then two stride-1 stages give a 16x16x8 map (3.2 mm/cell
+    in-plane) instead of 4x4x2, then:
+        center  fixed Gaussian weights centred on the nodule
+        attn    learned spatial attention plus a learned centre-distance bias
+    The local pool is concatenated with the global pool before the projection.
+
+    Attribute names must stay as they are: train_lesion_encoder.py saves
+    state_dicts from this exact class, and MyEmbedding loads them by key.
+    """
+
+    def __init__(self, mode, dim=4096, width=32, sigma=2.0):
+        super().__init__()
+        assert mode in ('center', 'attn'), mode
+        self.mode = mode
+        self.net = nn.Sequential(_conv_block(1, width, 2), _conv_block(width, width * 2, 2),
+                                 _conv_block(width * 2, width * 4, 1), _conv_block(width * 4, width * 4, 1))
+        c = width * 4
+        g = torch.stack(torch.meshgrid(torch.arange(16.), torch.arange(16.), torch.arange(8.), indexing='ij'))
+        centre = torch.tensor([7.5, 7.5, 3.5]).view(3, 1, 1, 1)
+        scale = torch.tensor([1., 1., 2.]).view(3, 1, 1, 1)   # z cells are 2x as thick (64x64x32 crop)
+        d2 = (((g - centre) * scale) ** 2).sum(0)
+        self.register_buffer('d2', d2)
+        w = torch.exp(-d2 / (2 * sigma ** 2))
+        self.register_buffer('gauss', w / w.sum())
+        if mode == 'attn':
+            self.att = nn.Conv3d(c, 1, 1)
+            self.dist_scale = nn.Parameter(torch.tensor(-0.1))
+        self.fc = nn.Linear(2 * c, dim)
+
+    def forward(self, x):
+        # x: (N, 1, 64, 64, 32) -> (N, dim)
+        f = self.net(x)                                     # (N, C, 16, 16, 8)
+        glob = f.mean((2, 3, 4))
+        if self.mode == 'center':
+            loc = (f * self.gauss.to(f.dtype)).sum((2, 3, 4))
+        else:
+            logits = self.att(f)[:, 0] + self.dist_scale * self.d2.to(f.dtype)
+            w = torch.softmax(logits.flatten(1).float(), 1).to(f.dtype).view_as(logits)
+            loc = (f * w.unsqueeze(1)).sum((2, 3, 4))
+        return self.fc(torch.cat([loc, glob], 1))
+
+
+LESION_ARCHS = ('gap', 'center', 'attn')
+
+
+def build_lesion_encoder(arch='gap', dim=4096):
+    if arch == 'gap':
+        return LesionEncoder(dim=dim)
+    return PooledLesionEncoder(arch, dim=dim)
+
+
+def load_pretrained_lesion_encoder(encoder, path, arch):
+    """Load a best.pt written by evaluation/train_lesion_encoder.py."""
+    # weights_only=False: our own file, and its metrics dict holds numpy scalars,
+    # which torch>=2.6's default weights_only=True refuses to unpickle
+    blob = torch.load(path, map_location='cpu', weights_only=False)
+    if blob.get('arch') != arch:
+        raise ValueError(f'{path} was trained as arch={blob.get("arch")!r} but lesion_arch={arch!r}')
+    encoder.load_state_dict(blob['encoder'], strict=True)
+    m = blob.get('metrics', {})
+    print(f'[lesion] loaded pretrained {arch} encoder from {path} '
+          f'(val rho {m.get("rho", float("nan")):.3f}, kappa {m.get("kappa", float("nan")):.3f})')
+
+
 class MyEmbedding(nn.Module):
-    def __init__(self, pretrained_visual_encoder=None, pretrained_adapter=None, num_embeddings=32000, embedding_dim=4096, perceiver_num=32, vis_dim=768, patch_size=32, frame_patch_size=4, seg_channel=256):
+    def __init__(self, pretrained_visual_encoder=None, pretrained_adapter=None, num_embeddings=32000, embedding_dim=4096, perceiver_num=32, vis_dim=768, patch_size=32, frame_patch_size=4, seg_channel=256,
+                 lesion_arch='gap', lesion_encoder_ckpt=None, freeze_lesion_encoder=False):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
@@ -155,7 +235,19 @@ class MyEmbedding(nn.Module):
         self.fc = nn.Linear(self.vis_dim, self.embedding_dim)
         self.mask_fc = nn.Linear(255, self.embedding_dim)
 
-        self.lesion_encoder = LesionEncoder(dim=self.embedding_dim)
+        # docs/LESION_TOKENS.md; lesion_arch='gap' is the original B2 encoder.
+        # B3a: a pooled encoder pretrained on size + RADS, optionally frozen so the
+        # LM loss cannot wash out what it learned.
+        self.lesion_arch = lesion_arch
+        self.lesion_encoder = build_lesion_encoder(lesion_arch, dim=self.embedding_dim)
+        if lesion_encoder_ckpt:
+            load_pretrained_lesion_encoder(self.lesion_encoder, lesion_encoder_ckpt, lesion_arch)
+        if freeze_lesion_encoder:
+            if not lesion_encoder_ckpt:
+                print('[lesion] WARNING: freezing a randomly initialised lesion encoder')
+            for p in self.lesion_encoder.parameters():
+                p.requires_grad = False
+        print(f'[lesion] arch={lesion_arch} pretrained={bool(lesion_encoder_ckpt)} frozen={bool(freeze_lesion_encoder)}')
 
     def forward(self, vision_x, mask_x, text_input, region2areas, lesion_x=None, lesion_slots=None):
         # 获取输入张量vision_x的形状，并将各个维度的大小赋值给相应的变量

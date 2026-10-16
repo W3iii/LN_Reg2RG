@@ -14,7 +14,8 @@ import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer
 
 class Reg2RG(nn.Module):
-    def __init__(self, text_tokenizer_path, lang_model_path, pretrained_visual_encoder, pretrained_adapter, max_region_size=10, max_img_size = 1, image_num = 32):
+    def __init__(self, text_tokenizer_path, lang_model_path, pretrained_visual_encoder, pretrained_adapter, max_region_size=10, max_img_size = 1, image_num = 32,
+                 lesion_arch='gap', lesion_encoder_ckpt=None, freeze_lesion_encoder=False):
         super(Reg2RG, self).__init__()
         # tokenizer
         self.image_padding_tokens = []
@@ -93,7 +94,10 @@ class Reg2RG(nn.Module):
         # for param in self.lang_model.parameters():
         #     param.requires_grad = False
 
-        self.embedding_layer = MyEmbedding(pretrained_visual_encoder, pretrained_adapter)
+        self.embedding_layer = MyEmbedding(pretrained_visual_encoder, pretrained_adapter,
+                                           lesion_arch=lesion_arch,
+                                           lesion_encoder_ckpt=lesion_encoder_ckpt,
+                                           freeze_lesion_encoder=freeze_lesion_encoder)
         # The vision encoder loads in fp32; cast before tying the word embedding so
         # the whole input-embedding path is one dtype (the tie shares a Parameter
         # object, so casting after would silently re-cast the LLM's embedding too).

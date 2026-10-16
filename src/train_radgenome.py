@@ -132,7 +132,13 @@ def main():
         text_tokenizer_path=model_args.tokenizer_path,
         pretrained_visual_encoder=model_args.pretrained_visual_encoder,
         pretrained_adapter=model_args.pretrained_adapter,
+        lesion_arch=model_args.lesion_arch,
+        lesion_encoder_ckpt=model_args.lesion_encoder_ckpt or None,
+        freeze_lesion_encoder=model_args.freeze_lesion_encoder,
     )
+    n_les = sum(p.numel() for p in model.embedding_layer.lesion_encoder.parameters())
+    n_les_tr = sum(p.numel() for p in model.embedding_layer.lesion_encoder.parameters() if p.requires_grad)
+    print(f'[train] lesion encoder params: {n_les:,} total, {n_les_tr:,} trainable')
     
     trainer = Trainer(model=model, 
                       train_dataset = Train_dataset, 

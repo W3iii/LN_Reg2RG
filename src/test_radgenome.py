@@ -149,6 +149,7 @@ def main():
         lang_model_path=model_args.lang_encoder_path,
         pretrained_visual_encoder=model_args.pretrained_visual_encoder,
         pretrained_adapter=model_args.pretrained_adapter,
+        lesion_arch=model_args.lesion_arch,
     )
 
     ckpt = torch.load(model_args.ckpt_path, map_location='cpu')

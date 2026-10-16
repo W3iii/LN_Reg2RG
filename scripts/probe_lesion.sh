@@ -10,6 +10,7 @@
 # Usage (from anywhere):
 #   bash scripts/probe_lesion.sh                       # B2, seed 1, step 1390
 #   SEED=2 STEP=1251 bash scripts/probe_lesion.sh
+#   EXP=Reg2RG_ncku_lobe5_B3a ARCH=attn bash scripts/probe_lesion.sh
 #
 # Outputs: results/features_lesion_*.npz (git-ignored by results/features_*.npz),
 #          outputs/seed_sweep_logs/probe_lesion_<exp>_seed<seed>_ckpt<step>.log
@@ -24,10 +25,12 @@ DATA_ROOT="${DATA_ROOT:-/root/notebooks/groups/BME/reg2rg_nifti}"
 EXP="${EXP:-Reg2RG_ncku_lobe5_lesion}"
 SEED="${SEED:-1}"
 STEP="${STEP:-1390}"
+ARCH="${ARCH:-gap}"      # lesion encoder arch of this checkpoint: gap (B2) | attn | center
 
 ckpt="outputs/${EXP}_seed${SEED}/checkpoint-${STEP}/pytorch_model.bin"
 feat="results/features_lesion_${EXP}_seed${SEED}_ckpt${STEP}.npz"
-rand="results/features_lesion_random_init.npz"
+rand_suffix=""; [ "$ARCH" != gap ] && rand_suffix="_$ARCH"
+rand="results/features_lesion_random_init${rand_suffix}.npz"
 log="outputs/seed_sweep_logs/probe_lesion_${EXP}_seed${SEED}_ckpt${STEP}.log"
 mkdir -p results outputs/seed_sweep_logs
 
@@ -36,20 +39,20 @@ mkdir -p results outputs/seed_sweep_logs
 # test split is deliberately not extracted
 if [ ! -f "$feat" ]; then
     echo "[probe_lesion] extracting $feat"
-    "$PY" evaluation/extract_lesion_features.py --ckpt "$ckpt" \
+    "$PY" evaluation/extract_lesion_features.py --ckpt "$ckpt" --lesion_arch "$ARCH" \
         --data_root "$DATA_ROOT" --splits train,val --out "$feat"
 fi
 if [ ! -f "$rand" ]; then
     echo "[probe_lesion] extracting random-init control $rand"
-    "$PY" evaluation/extract_lesion_features.py --random_init \
+    "$PY" evaluation/extract_lesion_features.py --random_init --lesion_arch "$ARCH" \
         --data_root "$DATA_ROOT" --splits train,val --out "$rand"
 fi
 
 {
     echo "##### $(date -Is)  ckpt=$ckpt"
     echo "##### val only (clean: the encoder never trained on these patients)"
-    "$PY" evaluation/probe_lesion.py --features B2="$feat" rand="$rand" --splits val
+    "$PY" evaluation/probe_lesion.py --features model="$feat" rand="$rand" --splits val
     echo
     echo "##### train+val (tighter CIs; encoder has seen the train patients)"
-    "$PY" evaluation/probe_lesion.py --features B2="$feat" rand="$rand" --splits train,val
+    "$PY" evaluation/probe_lesion.py --features model="$feat" rand="$rand" --splits train,val
 } 2>&1 | grep -v -i "warning" | tee "$log"

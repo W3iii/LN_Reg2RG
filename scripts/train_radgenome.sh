@@ -64,6 +64,9 @@ CUDA_VISIBLE_DEVICES=$cuda_devices "${launcher[@]}" ../src/${script_name}.py \
     --report_file "$report_file" \
     --monai_cache_dir "$monai_cache_dir" \
     --nodule_metadata "$nodule_metadata" \
+    --lesion_arch "$lesion_arch" \
+    --lesion_encoder_ckpt "$lesion_encoder_ckpt" \
+    --freeze_lesion_encoder "$freeze_lesion_encoder" \
     --output_dir "$output_dir" \
     --seed $seed \
     --per_device_train_batch_size $per_device_train_batch_size \

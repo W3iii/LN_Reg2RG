@@ -14,6 +14,8 @@ class ModelArguments:
         default="/jhcnas5/chenzhixuan/MyOpenSource/huggingface/Reg2RG/RadFM_perceiver_fc.pth")
     ckpt_path: Optional[str] = field(   
         default="/jhcnas5/chenzhixuan/MyOpenSource/huggingface/Reg2RG/pytorch_model.bin")
+    # Must match the checkpoint's training arm, or load_state_dict(strict=True) fails.
+    lesion_arch: str = field(default='gap', metadata={'help': 'gap | center | attn'})
 
 @dataclass
 class DataArguments:
