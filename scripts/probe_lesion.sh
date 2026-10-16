@@ -14,6 +14,7 @@
 # Outputs: results/features_lesion_*.npz (git-ignored by results/features_*.npz),
 #          outputs/seed_sweep_logs/probe_lesion_<exp>_seed<seed>_ckpt<step>.log
 set -eu
+export PYTHONWARNINGS=ignore   # silences sklearn worker warnings too (main-process filters do not reach joblib workers)
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
