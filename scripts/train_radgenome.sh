@@ -67,6 +67,8 @@ CUDA_VISIBLE_DEVICES=$cuda_devices "${launcher[@]}" ../src/${script_name}.py \
     --lesion_arch "$lesion_arch" \
     --lesion_encoder_ckpt "$lesion_encoder_ckpt" \
     --freeze_lesion_encoder "$freeze_lesion_encoder" \
+    --lesion_pred_csv "$lesion_pred_csv" \
+    --lesion_order "$lesion_order" \
     --output_dir "$output_dir" \
     --seed $seed \
     --per_device_train_batch_size $per_device_train_batch_size \

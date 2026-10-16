@@ -27,4 +27,7 @@ class DataArguments:
     # tokens and evaluated without them (or the reverse) gets a prompt whose
     # <lesion*> ids point at zero embeddings, and nothing raises.
     nodule_metadata: Optional[str] = field(default='')
+    # Must match training too (B3c): same prediction csv, same order.
+    lesion_pred_csv: Optional[str] = field(default='')
+    lesion_order: str = field(default='truth', metadata={'help': 'truth | pred'})
     result_path: Optional[str] = field(default='/home/chenzhixuan/Workspace/Reg2RG/results/radgenome_combined_reports.csv')

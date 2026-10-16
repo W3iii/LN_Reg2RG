@@ -28,16 +28,32 @@ LESION_CROP_SIZE = (64, 64, 32)
 BBOX_COLS = ['y0_crop', 'y1_crop', 'x0_crop', 'x1_crop', 'z0_crop', 'z1_crop']
 
 
-def load_nodule_index(csv_path, max_per_region=None):
-    """(Volumename, region) -> nodule records, best first.
+def load_nodule_index(csv_path, max_per_region=None, pred_csv=None, order='truth'):
+    """(Volumename, region) -> [(box, pred_mm), ...], first = the one to lead with.
 
-    Ranked by tw_lung_rads then eq_diam_mm, both descending, per
-    docs/LESION_TOKENS.md §2: when a lobe holds more nodules than there are slots,
-    the ones kept should be the ones a radiologist would lead with. Only 15 of
-    3144 (patient, lobe) pairs have more than 8, so this rarely bites -- and the
-    lobe's report text still describes every nodule either way, so overflow costs
-    visual detail, never a training target.
+    order='truth'  rank by tw_lung_rads then eq_diam_mm, both descending (B2/B3a).
+                   Both are ground truth, so at inference the *position* of a
+                   lesion token already tells the decoder which nodule is the
+                   most severe and the largest -- an oracle leak, see
+                   docs/LESION_TOKENS.md.
+    order='pred'   rank by the lesion encoder's predicted diameter, descending
+                   (B3c). Uses no label at all.
+
+    pred_csv: outputs/lesion_pred_<arch>_seed<seed>.csv from
+    evaluation/predict_lesion_attributes.py (out-of-fold for train, full-train
+    encoder for val/test). When given, each record carries pred_mm, which the
+    Dataset writes into the prompt as "<lesionK> (~X mm)"; otherwise pred_mm is
+    None and the prompt is byte-identical to B2/B3a.
+
+    Overflow (>max_per_region in a lobe) keeps the first ones under the chosen
+    order. Only 15 of 3144 (patient, lobe) pairs have more than 8, and the lobe's
+    report text still describes every nodule, so overflow costs visual detail,
+    never a training target.
     """
+    if order not in ('truth', 'pred'):
+        raise ValueError(f"order must be 'truth' or 'pred', got {order!r}")
+    if order == 'pred' and not pred_csv:
+        raise ValueError("order='pred' needs pred_csv")
     df = pd.read_csv(csv_path)
 
     missing = [c for c in BBOX_COLS + ['Volumename', 'region'] if c not in df.columns]
@@ -50,19 +66,42 @@ def load_nodule_index(csv_path, max_per_region=None):
     for c in ('tw_lung_rads', 'eq_diam_mm'):
         if c not in df.columns:
             df[c] = 0.0
-    df = df.sort_values(['tw_lung_rads', 'eq_diam_mm'], ascending=False)
+
+    df['pred_mm'] = np.nan
+    if pred_csv:
+        p = pd.read_csv(pred_csv)[['Volumename', 'nodule_id', 'pred_diam_mm']]
+        if p.duplicated(['Volumename', 'nodule_id']).any():
+            raise ValueError(f'{pred_csv}: duplicate (Volumename, nodule_id) rows')
+        df = df.drop(columns='pred_mm').merge(p, on=['Volumename', 'nodule_id'], how='left')
+        df = df.rename(columns={'pred_diam_mm': 'pred_mm'})
+        n_miss = int(df['pred_mm'].isna().sum())
+        if n_miss:
+            raise ValueError(f'{pred_csv} has no prediction for {n_miss} of {len(df)} nodules '
+                             f'in {csv_path}; regenerate it from the same nodule_metadata.csv')
+
+    if order == 'truth':
+        df = df.sort_values(['tw_lung_rads', 'eq_diam_mm'], ascending=False)
+    else:
+        df = df.sort_values(['pred_mm', 'nodule_id'], ascending=[False, True])
 
     index = {}
     for (vol, region), grp in df.groupby(['Volumename', 'region'], sort=False):
         if max_per_region is not None:
             grp = grp.head(max_per_region)
         index[(str(vol), str(region))] = [
-            (int(r.y0_crop), int(r.y1_crop), int(r.x0_crop),
-             int(r.x1_crop), int(r.z0_crop), int(r.z1_crop))
+            ((int(r.y0_crop), int(r.y1_crop), int(r.x0_crop),
+              int(r.x1_crop), int(r.z0_crop), int(r.z1_crop)),
+             None if pd.isna(r.pred_mm) else float(r.pred_mm))
             for r in grp.itertuples()
         ]
     return index
 
+
+def lesion_token_text(slot, pred_mm):
+    """'<lesion12>' or, with a predicted size, '<lesion12> (~7 mm)'."""
+    if pred_mm is None:
+        return f'<lesion{slot}>'
+    return f'<lesion{slot}> (~{max(1, int(round(pred_mm)))} mm)'
 
 def crop_lesion(img, bbox, size=LESION_CROP_SIZE):
     """Crop `img` at `bbox`, centred in a fixed-size zero-padded array.

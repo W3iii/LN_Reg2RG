@@ -48,6 +48,9 @@ report_file="$DATA_ROOT/region_report_${split}.csv"
 nodule_metadata="${nodule_metadata:-}"
 # Must match the checkpoint's lesion encoder architecture (gap | center | attn).
 lesion_arch="${lesion_arch:-gap}"
+# B3c: must be the same csv and order the checkpoint was trained with.
+lesion_pred_csv="${lesion_pred_csv:-}"
+lesion_order="${lesion_order:-truth}"
 
 # Results — tagged by split, checkpoint, and run_tag so runs do not overwrite (or
 # get silently skipped against) each other. test_radgenome.py appends and skips

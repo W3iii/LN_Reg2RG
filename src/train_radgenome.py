@@ -124,6 +124,8 @@ def main():
         csv_file=data_args.report_file,
         cache_dir=data_args.monai_cache_dir,
         nodule_metadata=data_args.nodule_metadata or None,
+        lesion_pred_csv=data_args.lesion_pred_csv or None,
+        lesion_order=data_args.lesion_order,
     )
 
     print("Setup Model")

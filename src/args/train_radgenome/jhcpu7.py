@@ -26,6 +26,10 @@ class DataArguments:
     # Empty = lesion tokens off (the B0 baseline). Point it at nodule_metadata.csv
     # to run the B2 lesion arm; see docs/LESION_TOKENS.md.
     nodule_metadata: Optional[str] = field(default='')
+    # B3c: predicted sizes in the prompt ('<lesionK> (~X mm)') and label-free
+    # lesion ordering. Empty csv + 'truth' = B2/B3a behaviour.
+    lesion_pred_csv: Optional[str] = field(default='')
+    lesion_order: str = field(default='truth', metadata={'help': 'truth | pred'})
     
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):

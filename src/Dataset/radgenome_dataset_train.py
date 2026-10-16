@@ -38,7 +38,7 @@ CONDITIONS = [
 ]
 
 from regions import REGIONS, MAX_LESION_PER_REGION, lesion_token_names
-from lesion_utils import load_nodule_index, crop_lesion, normalize_lesion
+from lesion_utils import load_nodule_index, crop_lesion, normalize_lesion, lesion_token_text
 
 class RadGenomeDataset_Train(PersistentDataset):
     # NOTE: nodule_metadata defaults to None, i.e. lesion tokens OFF. The B0
@@ -46,7 +46,7 @@ class RadGenomeDataset_Train(PersistentDataset):
     # runnable from one checkout -- and, more importantly, a seed sweep started
     # before the lesion work landed keeps producing baseline runs instead of
     # silently switching arms partway through.
-    def __init__(self, text_tokenizer, data_folder, mask_folder, csv_file, cache_dir, max_region_size=5, max_img_size = 1, image_num = 32, region_num=33, max_seq=2048, resize_dim=500, voc_size=32000, force_num_frames=True, nodule_metadata=None):
+    def __init__(self, text_tokenizer, data_folder, mask_folder, csv_file, cache_dir, max_region_size=5, max_img_size = 1, image_num = 32, region_num=33, max_seq=2048, resize_dim=500, voc_size=32000, force_num_frames=True, nodule_metadata=None, lesion_pred_csv=None, lesion_order='truth'):
         # text_tokenizer
         self.text_tokenizer = AutoTokenizer.from_pretrained(
                 text_tokenizer,
@@ -96,11 +96,13 @@ class RadGenomeDataset_Train(PersistentDataset):
 
         self.max_region_size = max_region_size
         self.nodule_index = (
-            load_nodule_index(nodule_metadata, MAX_LESION_PER_REGION)
+            load_nodule_index(nodule_metadata, MAX_LESION_PER_REGION,
+                              pred_csv=lesion_pred_csv, order=lesion_order)
             if nodule_metadata else None)
         if self.nodule_index is not None:
             print(f'[dataset] lesion tokens ON: {len(self.nodule_index)} '
-                  f'(volume, region) pairs from {nodule_metadata}')
+                  f'(volume, region) pairs from {nodule_metadata}; '
+                  f'order={lesion_order}, predicted sizes in prompt={bool(lesion_pred_csv)}')
         self.voc_size = voc_size
         self.max_seq = max_seq
         self.data_folder = data_folder
@@ -255,7 +257,7 @@ class RadGenomeDataset_Train(PersistentDataset):
                 boxes = self.nodule_index.get((volume_name, region))
                 if boxes:
                     lesion_crops[region] = [
-                        normalize_lesion(crop_lesion(img_data, b)) for b in boxes]
+                        (normalize_lesion(crop_lesion(img_data, b)), mm) for b, mm in boxes]
 
         # process img_data
         img_data = img_data[np.newaxis, ...]
@@ -291,7 +293,9 @@ class RadGenomeDataset_Train(PersistentDataset):
             region_text = region_text + "The region " + str(i) + " is " + '<region>' + self.region_padding_tokens[i] + '</region>'
             lesion_tokens = lesion_tokens_per_slot.get(i, [])
             if lesion_tokens:
-                region_text = region_text + " with lesions " + "".join(lesion_tokens)
+                # no sizes -> joined with "", byte-identical to the B2/B3a prompt
+                sep = ", " if any(t.endswith(" mm)") for t in lesion_tokens) else ""
+                region_text = region_text + " with lesions " + sep.join(lesion_tokens)
             region_text = region_text + '. '
         text = region_text + text
 
@@ -333,11 +337,11 @@ class RadGenomeDataset_Train(PersistentDataset):
             crops = lesion_crops.get(region2area[i], [])
             if crops:
                 toks = []
-                for k, crop in enumerate(crops):
+                for k, (crop, pred_mm) in enumerate(crops):
                     slot = i * MAX_LESION_PER_REGION + k
                     lesion_crop_list.append(crop)
                     lesion_slot_list.append(slot)
-                    toks.append(f'<lesion{slot}>')
+                    toks.append(lesion_token_text(slot, pred_mm))
                 lesion_tokens_per_slot[i] = toks
 
         if lesion_crop_list:

@@ -57,6 +57,12 @@ lesion_arch="${lesion_arch:-gap}"
 lesion_encoder_ckpt="${lesion_encoder_ckpt:-}"
 freeze_lesion_encoder="${freeze_lesion_encoder:-False}"
 
+# B3c: predicted sizes written into the prompt + label-free lesion order.
+#   ... lesion_encoder_ckpt=$REPO_ROOT/outputs/lesion_pred_attn_seed0_full.pt \
+#   lesion_pred_csv=$REPO_ROOT/outputs/lesion_pred_attn_seed0.csv lesion_order=pred ...
+lesion_pred_csv="${lesion_pred_csv:-}"
+lesion_order="${lesion_order:-truth}"
+
 # Outputs — inside the project directory, one directory per seed.
 # HF Trainer's _rotate_checkpoints sorts by mtime, not by step, so a second run
 # writing into an existing output_dir deletes the earlier run's checkpoints once
