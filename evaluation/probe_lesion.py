@@ -28,24 +28,38 @@ If train patients are included the encoder has seen them; report val alone as
 the clean number and train+val only for its tighter CIs (as HANDOFF.md §9 did).
 """
 import argparse
+import warnings
 
 import numpy as np
 from scipy.stats import spearmanr
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import cohen_kappa_score, roc_auc_score
-from sklearn.model_selection import GridSearchCV, GroupKFold
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import GridSearchCV, GroupKFold, StratifiedGroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 
-def inner_cv(X, y, g):
-    return list(GroupKFold(n_splits=3).split(X, y, g))   # a list, not a generator: newer joblib cannot pickle generators
+warnings.filterwarnings('ignore')   # ill-conditioned ridge solves and lbfgs chatter drown the tables
+
+
+def inner_cv(X, y, g, stratify=False):
+    # a list, not a generator: newer joblib cannot pickle generators
+    if stratify:
+        return list(StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=0).split(X, y, g))
+    return list(GroupKFold(n_splits=3).split(X, y, g))
+
+
+def pipe(model):
+    # median imputation: a few nodules (doctor-bbox only, no ME mask) have no
+    # bbox_long_mm / size_vox, which made the size-oracle row crash
+    return Pipeline([('imp', SimpleImputer(strategy='median')), ('sc', StandardScaler()), ('m', model)])
 
 
 def oof_regress(X, y, g, folds):
     oof = np.zeros(len(y))
     for tr, te in GroupKFold(n_splits=folds).split(X, y, g):
-        gs = GridSearchCV(Pipeline([('sc', StandardScaler()), ('m', Ridge())]),
+        gs = GridSearchCV(pipe(Ridge()),
                           {'m__alpha': [1e-1, 1, 1e1, 1e2, 1e3, 1e4]},
                           scoring='neg_mean_absolute_error', cv=inner_cv(X[tr], y[tr], g[tr]), n_jobs=-1)
         gs.fit(X[tr], y[tr])
@@ -56,13 +70,15 @@ def oof_regress(X, y, g, folds):
 def oof_classify(X, y, g, folds, binary):
     classes = np.unique(y)
     oof = np.zeros((len(y), 1 if binary else len(classes)))
-    for tr, te in GroupKFold(n_splits=folds).split(X, y, g):
+    # Stratified by class within patient groups: RADS 4 is ~3% of nodules, and a
+    # plain GroupKFold left whole folds without it (log-loss then refused to score).
+    outer = StratifiedGroupKFold(n_splits=folds, shuffle=True, random_state=0)
+    for tr, te in outer.split(X, y, g):
         gs = GridSearchCV(
-            Pipeline([('sc', StandardScaler()),
-                      ('m', LogisticRegression(max_iter=20000, class_weight='balanced'))]),
+            pipe(LogisticRegression(max_iter=20000, class_weight='balanced')),
             {'m__C': [1e-3, 1e-2, 1e-1, 1.0]},
-            scoring='roc_auc' if binary else 'neg_log_loss',
-            cv=inner_cv(X[tr], y[tr], g[tr]), n_jobs=-1)
+            scoring='roc_auc' if binary else 'balanced_accuracy',
+            cv=inner_cv(X[tr], y[tr], g[tr], stratify=True), n_jobs=-1)
         gs.fit(X[tr], y[tr])
         p = gs.best_estimator_.predict_proba(X[te])
         if binary:
