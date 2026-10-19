@@ -126,6 +126,7 @@ def main():
         nodule_metadata=data_args.nodule_metadata or None,
         lesion_pred_csv=data_args.lesion_pred_csv or None,
         lesion_order=data_args.lesion_order,
+        lesion_size_unit=data_args.lesion_size_unit,
     )
 
     print("Setup Model")

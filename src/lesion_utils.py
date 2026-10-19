@@ -97,11 +97,21 @@ def load_nodule_index(csv_path, max_per_region=None, pred_csv=None, order='truth
     return index
 
 
-def lesion_token_text(slot, pred_mm):
-    """'<lesion12>' or, with a predicted size, '<lesion12> (~7 mm)'."""
+def lesion_token_text(slot, pred_mm, unit='mm'):
+    """'<lesion12>', or with a predicted size '<lesion12> (~7 mm)' / '<lesion12> (~0.7cm)'.
+
+    unit='cm' writes the size the way ~79% of the reports do ('about 0.7cm'), so
+    the LLM can copy it verbatim. With 'mm' (B3c) the model had to convert units
+    itself and got it wrong often enough to matter -- e.g. '(~4 mm)' came out as
+    '5.5cm' (CHESTCT0915, val).
+    """
     if pred_mm is None:
         return f'<lesion{slot}>'
-    return f'<lesion{slot}> (~{max(1, int(round(pred_mm)))} mm)'
+    if unit == 'cm':
+        return f'<lesion{slot}> (~{max(0.1, round(pred_mm / 10.0, 1)):.1f}cm)'
+    if unit == 'mm':
+        return f'<lesion{slot}> (~{max(1, int(round(pred_mm)))} mm)'
+    raise ValueError(f"unit must be 'mm' or 'cm', got {unit!r}")
 
 def crop_lesion(img, bbox, size=LESION_CROP_SIZE):
     """Crop `img` at `bbox`, centred in a fixed-size zero-padded array.

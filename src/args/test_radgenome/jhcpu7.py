@@ -30,4 +30,6 @@ class DataArguments:
     # Must match training too (B3c): same prediction csv, same order.
     lesion_pred_csv: Optional[str] = field(default='')
     lesion_order: str = field(default='truth', metadata={'help': 'truth | pred'})
+    # B3d: 'cm' writes '(~0.7cm)' like the reports; 'mm' = B3c.
+    lesion_size_unit: str = field(default='mm', metadata={'help': 'mm | cm'})
     result_path: Optional[str] = field(default='/home/chenzhixuan/Workspace/Reg2RG/results/radgenome_combined_reports.csv')

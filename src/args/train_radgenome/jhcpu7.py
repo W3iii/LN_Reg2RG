@@ -30,6 +30,8 @@ class DataArguments:
     # lesion ordering. Empty csv + 'truth' = B2/B3a behaviour.
     lesion_pred_csv: Optional[str] = field(default='')
     lesion_order: str = field(default='truth', metadata={'help': 'truth | pred'})
+    # B3d: 'cm' writes '(~0.7cm)' like the reports; 'mm' = B3c.
+    lesion_size_unit: str = field(default='mm', metadata={'help': 'mm | cm'})
     
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):

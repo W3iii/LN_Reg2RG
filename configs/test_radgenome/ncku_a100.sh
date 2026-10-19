@@ -51,6 +51,7 @@ lesion_arch="${lesion_arch:-gap}"
 # B3c: must be the same csv and order the checkpoint was trained with.
 lesion_pred_csv="${lesion_pred_csv:-}"
 lesion_order="${lesion_order:-truth}"
+lesion_size_unit="${lesion_size_unit:-mm}"
 
 # Results — tagged by split, checkpoint, and run_tag so runs do not overwrite (or
 # get silently skipped against) each other. test_radgenome.py appends and skips

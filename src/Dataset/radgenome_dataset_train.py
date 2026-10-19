@@ -46,7 +46,7 @@ class RadGenomeDataset_Train(PersistentDataset):
     # runnable from one checkout -- and, more importantly, a seed sweep started
     # before the lesion work landed keeps producing baseline runs instead of
     # silently switching arms partway through.
-    def __init__(self, text_tokenizer, data_folder, mask_folder, csv_file, cache_dir, max_region_size=5, max_img_size = 1, image_num = 32, region_num=33, max_seq=2048, resize_dim=500, voc_size=32000, force_num_frames=True, nodule_metadata=None, lesion_pred_csv=None, lesion_order='truth'):
+    def __init__(self, text_tokenizer, data_folder, mask_folder, csv_file, cache_dir, max_region_size=5, max_img_size = 1, image_num = 32, region_num=33, max_seq=2048, resize_dim=500, voc_size=32000, force_num_frames=True, nodule_metadata=None, lesion_pred_csv=None, lesion_order='truth', lesion_size_unit='mm'):
         # text_tokenizer
         self.text_tokenizer = AutoTokenizer.from_pretrained(
                 text_tokenizer,
@@ -102,7 +102,11 @@ class RadGenomeDataset_Train(PersistentDataset):
         if self.nodule_index is not None:
             print(f'[dataset] lesion tokens ON: {len(self.nodule_index)} '
                   f'(volume, region) pairs from {nodule_metadata}; '
-                  f'order={lesion_order}, predicted sizes in prompt={bool(lesion_pred_csv)}')
+                  f'order={lesion_order}, predicted sizes in prompt={bool(lesion_pred_csv)}'
+                  + (f' ({lesion_size_unit})' if lesion_pred_csv else ''))
+        if lesion_size_unit not in ('mm', 'cm'):
+            raise ValueError(f"lesion_size_unit must be 'mm' or 'cm', got {lesion_size_unit!r}")
+        self.lesion_size_unit = lesion_size_unit
         self.voc_size = voc_size
         self.max_seq = max_seq
         self.data_folder = data_folder
@@ -294,7 +298,7 @@ class RadGenomeDataset_Train(PersistentDataset):
             lesion_tokens = lesion_tokens_per_slot.get(i, [])
             if lesion_tokens:
                 # no sizes -> joined with "", byte-identical to the B2/B3a prompt
-                sep = ", " if any(t.endswith(" mm)") for t in lesion_tokens) else ""
+                sep = ", " if any("(~" in t for t in lesion_tokens) else ""
                 region_text = region_text + " with lesions " + sep.join(lesion_tokens)
             region_text = region_text + '. '
         text = region_text + text
@@ -341,7 +345,7 @@ class RadGenomeDataset_Train(PersistentDataset):
                     slot = i * MAX_LESION_PER_REGION + k
                     lesion_crop_list.append(crop)
                     lesion_slot_list.append(slot)
-                    toks.append(lesion_token_text(slot, pred_mm))
+                    toks.append(lesion_token_text(slot, pred_mm, self.lesion_size_unit))
                 lesion_tokens_per_slot[i] = toks
 
         if lesion_crop_list:
