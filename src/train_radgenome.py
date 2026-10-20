@@ -127,6 +127,7 @@ def main():
         lesion_pred_csv=data_args.lesion_pred_csv or None,
         lesion_order=data_args.lesion_order,
         lesion_size_unit=data_args.lesion_size_unit,
+        size_placeholder=data_args.size_placeholder,
     )
 
     print("Setup Model")

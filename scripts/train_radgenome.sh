@@ -70,6 +70,7 @@ CUDA_VISIBLE_DEVICES=$cuda_devices "${launcher[@]}" ../src/${script_name}.py \
     --lesion_pred_csv "$lesion_pred_csv" \
     --lesion_order "$lesion_order" \
     --lesion_size_unit "$lesion_size_unit" \
+    --size_placeholder "$size_placeholder" \
     --output_dir "$output_dir" \
     --seed $seed \
     --per_device_train_batch_size $per_device_train_batch_size \

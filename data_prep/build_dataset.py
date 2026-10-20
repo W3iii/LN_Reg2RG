@@ -94,14 +94,33 @@ DROP_SENT = [
     r'^\s*(?:low dose\s+)?(?:no\s+)?(?:available\s+)?previous\b',
     r'^\s*(?:Without\s+)?(?:As\s+)?[Cc]ompar(?:ing|ed) to previous',
     r'^\s*(?:stationary|persistent|unchanged|no change)\s*[.;]?\s*$',
+    # 英文報告裡夾雜的中文。查過原始文字, 這不是編碼損壞而是真的中文內容:
+    # 醫師姓名(翁, 鄭莉莉醫師)、院區(斗六分院, 大安婦幼)、中文病史(疑似腫瘤)、
+    # 部門(工務室員工), 以及一整段中文 addendum。都是影像推不出來的東西, 且含個資。
+    # 中文 CAD 樣板的病患在上游就整個排除了, 所以這條只會命中那 7 份混語言報告。
+    r'[一-鿿]',
 ]
 # 行內時序修飾 (名詞前的形容詞 / 附加子句)
 TEMPORAL_INLINE = [
     (r'^\s*(?:interval\s+)?(?:regression|progression|resolution|increase|decrease)\s+of\s+(?:the\s+)?', ''),
     (r',?\s*some (?:are\s+)?(?:sa?tationary|stationary)[^,.;]*', ''),
-    (r',?\s*(?:and\s+)?as compared\s+(?:with|to)[^.;]*', ''),
+    # 原始報告用的是動名詞 "as comparing to previous CT study on Sep. 6th last year",
+    # 不是 "as compared with" -> 少了 ing 這條就整段留下來
+    (r',?\s*(?:and\s+)?as compar(?:ed|ing)\s+(?:with|to)[^.;]*', ''),
     (r'^\s*The previously noted\s+', ''),
-    (r',?\s*(?:mild(?:ly)?|slight(?:ly)?)?\s*interval\s+(?:enlargement|change|increase|decrease)\b', ''),
+    # 連 without/with/no 一起吃掉。只拔 "interval change" 會留下孤懸的 "without",
+    # 訓練目標就變成 "A LLL subpleural small nodule without." 這種殘句。
+    # 名詞清單來自原始報告的實際統計; 刻意不含 "follow" (interval follow up 是建議, 不是比較)
+    (r',?\s*(?:without|with|no)?\s*(?:significant\s+)?'
+     r'(?:mild(?:ly)?|slight(?:ly)?|minimal)?\s*interval\s+'
+     r'(?:enlargement|changes?|increased?|decreased?|shrinkage|resolution|progression|'
+     r'regression|remission|stationary|partial|size)\b'
+     r'(?:\s+of\s+(?:these|this|the)\s+\w+)?', ''),
+    # "with minimal increase in size" 也是跟前次比出來的
+    (r',?\s*with\s+(?:minimal|mild(?:ly)?|slight(?:ly)?|marked(?:ly)?)?\s*'
+     r'(?:increase|decrease|change|enlargement|shrinkage)\s+in\s+size\b', ''),
+    # 拔完可能剩下懸空的介系詞
+    (r'\s+(?:without|with)\s*(?=[,.;]|$)', ''),
     (r'\s*with\s+(?:stationary|unchanged|increased|decreased|no)\s+(?:size|change)\b', ''),
     (r'\b(?:stationary|persistent|persisted|unchanged|newly developed)\s+(?=[a-z])', ''),
     (r'\s+(?:stationary|persistent|unchanged)\b(?=\s*[,.;]|\s*$)', ''),
@@ -118,10 +137,15 @@ TEMPORAL_CLAUSE = (r',\s*(?:stationary(?: after prior regression| in size)?|pers
 # 影像索引 -> 對不到 npy slice, 移除避免模型亂編號碼
 # 形式: (Srs/Img:4/20,602/27) / (Srs/Img:) / (S/I: 6/74) / 6/74
 SLICE_REF = [
-    r'\s*\(\s*S(?:rs?)?\s*/\s*I(?:mg)?\s*:[^)]*\)',       # (Srs/Img:4/20) 整個括號
-    r'[,;]?\s*S(?:rs?)?\s*/\s*I(?:mg)?\s*:\s*[\d/,\s]*',  # (0.5cm, Srs/Img:6/74) 只拔 ref 留大小
+    # 拼法有 Srs/Img: / Se/Im: / S/I: 三種, 且括號常常沒收尾就被截斷
+    r'\s*\(\s*S(?:rs?|e)?\s*/\s*I(?:mg|m)?\s*:?[^)]*\)?',  # (Srs/Img:4/20) 連括號; 未收尾也吃
+    r'[,;]?\s*S(?:rs?|e)?\s*/\s*I(?:mg|m)?\s*:\s*[\d/,\s]*',  # (0.5cm, Srs/Img:6/74) 只拔 ref 留大小
     r'\s*\(\s*Srs?\s*:[^)]*\)',                           # (Srs:3,arrows)
-    r'\s*\(?\s*\d{1,4}\s*/\s*\d{1,4}\s*\)?(?=[\s.,;]|$)',  # 裸的 6/74
+    # 裸的 6/74, 以及多張切片的續列 6/43,44 與 6/104,113,120,127。
+    # 不吃掉續列的話會留下 ",44" ",113,120,127" 這種尾巴。
+    # 尾隨數字必須綁在 <num>/<num> 後面才吃, 否則會誤傷 "3,5 cm" 這類合法寫法
+    # (原始報告裡 <num>,<num> 後接 mm/cm 的有 6 例)。
+    r'\s*\(?\s*\d{1,4}\s*/\s*\d{1,4}(?:\s*,\s*\d{1,4})*\s*\)?(?=[\s.,;]|$)',
     r'\(\s*[,;\s]*\)',                                    # 清掉拔完剩下的空括號
     r'[,;]\s*\)',                                         # (0.5cm, ) -> (0.5cm)
 ]
@@ -164,9 +188,45 @@ def split_sections(t):
     return t.strip(), ''
 
 
-def to_sentences(block):
+def unwrap(block):
+    """接回原始報告的硬換行。
+
+    來源報告是固定寬度排版, 句子會被折成好幾行:
+
+        1.A LUL fibrotic lesion. LLL small nodules without
+          interval change as comparing to previous CT study
+          on Sep. 6th last year.
+
+    照換行切的話 "LLL small nodules without" 和 "interval change as comparing…"
+    會變成兩個獨立句子, 任何跨行的清理規則都永遠對不上 —— 這才是 "without as"、
+    "A RLL ill-defined." 這類殘句的真正來源, 不是 regex 寫得不夠好。
+
+    只有在前一行沒有以句末標點收尾, 且這一行不是新的條列項時才接回去。
+    """
     out = []
     for line in block.split('\n'):
+        # 切片索引要先拔掉再判斷要不要接行。原始行常常以 ref 收尾:
+        #     A small solid nodule ... 1.5cm from the pleura. 6/74
+        #     Nonspecific linear atelectasis in the RML.
+        # 留著的話這行看起來沒有句末標點, 下一行就被誤接上來, 兩個不同肺葉的
+        # 發現被併成同一句, 之後也切不開 (ref 不是大寫開頭, 分句規則過不去)。
+        for p in SLICE_REF:
+            line = re.sub(p, '', line, flags=re.I)
+        t = line.strip()
+        if not t:
+            out.append('')
+            continue
+        new_item = re.match(r'^(?:\d+[.)]|[-\>\*•])', t)
+        if out and out[-1] and not new_item and not re.search(r'[.;:]$', out[-1]):
+            out[-1] += ' ' + t
+        else:
+            out.append(t)
+    return '\n'.join(out)
+
+
+def to_sentences(block):
+    out = []
+    for line in unwrap(block).split('\n'):
         line = line.strip()
         line = re.sub(r'^[\-\>\*\u2022]+\s*', '', line)         # bullet
         line = re.sub(r'^\d+[\.\)]\s*', '', line)               # 1. 2)

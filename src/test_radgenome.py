@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 from regions import REGIONS
+from size_placeholder import fill_report
 
 @dataclass
 class DataCollator(object):
@@ -110,14 +111,24 @@ def main():
     print(model_args.ckpt_path)
     
     # 判断结果保存路径是否存在，不存在则创建
+    columns = ["AccNum", "Question", "GT_combined_report", "Pred_combined_report"]
+    if data_args.size_placeholder:
+        # Pred_combined_report is the filled report (what every evaluation reads);
+        # the raw generation with its [SIZE] slots is kept beside it.
+        columns += ["Pred_raw_report", "n_size_slots", "n_unfilled"]
     if os.path.exists(data_args.result_path):
         df = pd.read_csv(data_args.result_path)
+        if list(df.columns) != columns:
+            raise SystemExit(f'{data_args.result_path} has columns {list(df.columns)}, expected {columns}; '
+                             f'use a new run_tag instead of appending to a different kind of run')
         inferenced_id = df["AccNum"].tolist()
     else:
         # 创建一个空的DataFrame
-        df = pd.DataFrame(columns=["AccNum", "Question", "GT_combined_report", "Pred_combined_report"])
+        df = pd.DataFrame(columns=columns)
         df.to_csv(data_args.result_path, index=False)
         inferenced_id = []
+    if data_args.size_placeholder and not data_args.lesion_pred_csv:
+        raise SystemExit('size_placeholder needs lesion_pred_csv: the [SIZE] slots are filled from it')
 
     print("Setup Data")
     Test_dataset = RadGenomeDataset_Test(
@@ -183,8 +194,15 @@ def main():
         print('Pred_report: ', pred_combined_report)
         
         # 将数据添加到DataFrame中并保存到CSV文件
-        new_data = pd.DataFrame([[acc_num, question, gt_combined_report, pred_combined_report]], 
-                                columns=["AccNum", "Question", "GT_combined_report", "Pred_combined_report"])
+        row = [acc_num, question, gt_combined_report, pred_combined_report]
+        if data_args.size_placeholder:
+            r2a = region2area[0] if isinstance(region2area, (list, tuple)) else region2area
+            preds_by_area = {area: [mm for _, mm in Test_dataset.nodule_index.get((acc_num, area), [])]
+                             for area in r2a.values()}
+            filled, n_slots, n_unfilled = fill_report(pred_combined_report, r2a, preds_by_area)
+            print('Pred_filled: ', filled, f'({n_slots} size slots, {n_unfilled} unfilled)')
+            row = [acc_num, question, gt_combined_report, filled, pred_combined_report, n_slots, n_unfilled]
+        new_data = pd.DataFrame([row], columns=columns)
         new_data.to_csv(data_args.result_path, mode='a', header=False, index=False)
 
 

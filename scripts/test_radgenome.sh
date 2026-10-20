@@ -32,4 +32,5 @@ CUDA_VISIBLE_DEVICES=$cuda_devices python ../src/${script_name}.py \
     --lesion_pred_csv "$lesion_pred_csv" \
     --lesion_order "$lesion_order" \
     --lesion_size_unit "$lesion_size_unit" \
+    --size_placeholder "$size_placeholder" \
     --result_path "$result_path"

@@ -39,6 +39,7 @@ CONDITIONS = [
 
 from regions import REGIONS, MAX_LESION_PER_REGION, lesion_token_names
 from lesion_utils import load_nodule_index, crop_lesion, normalize_lesion, lesion_token_text
+from size_placeholder import mask_sizes
 
 class RadGenomeDataset_Train(PersistentDataset):
     # NOTE: nodule_metadata defaults to None, i.e. lesion tokens OFF. The B0
@@ -46,7 +47,7 @@ class RadGenomeDataset_Train(PersistentDataset):
     # runnable from one checkout -- and, more importantly, a seed sweep started
     # before the lesion work landed keeps producing baseline runs instead of
     # silently switching arms partway through.
-    def __init__(self, text_tokenizer, data_folder, mask_folder, csv_file, cache_dir, max_region_size=5, max_img_size = 1, image_num = 32, region_num=33, max_seq=2048, resize_dim=500, voc_size=32000, force_num_frames=True, nodule_metadata=None, lesion_pred_csv=None, lesion_order='truth', lesion_size_unit='mm'):
+    def __init__(self, text_tokenizer, data_folder, mask_folder, csv_file, cache_dir, max_region_size=5, max_img_size = 1, image_num = 32, region_num=33, max_seq=2048, resize_dim=500, voc_size=32000, force_num_frames=True, nodule_metadata=None, lesion_pred_csv=None, lesion_order='truth', lesion_size_unit='mm', size_placeholder=False):
         # text_tokenizer
         self.text_tokenizer = AutoTokenizer.from_pretrained(
                 text_tokenizer,
@@ -107,6 +108,10 @@ class RadGenomeDataset_Train(PersistentDataset):
         if lesion_size_unit not in ('mm', 'cm'):
             raise ValueError(f"lesion_size_unit must be 'mm' or 'cm', got {lesion_size_unit!r}")
         self.lesion_size_unit = lesion_size_unit
+        # B3e: report targets carry '[SIZE]' instead of numbers (src/size_placeholder.py)
+        self.size_placeholder = size_placeholder
+        if size_placeholder:
+            print('[dataset] size placeholders ON: sizes in report targets -> [SIZE]')
         self.voc_size = voc_size
         self.max_seq = max_seq
         self.data_folder = data_folder
@@ -366,6 +371,8 @@ class RadGenomeDataset_Train(PersistentDataset):
         for i in range(len(region2area)):
             area = region2area[i]
             region_report = region_reports[area]
+            if self.size_placeholder:
+                region_report = mask_sizes(region_report)[0]
             combined_report = combined_report + "The region " + str(i) + " is " + area + ": " + region_report + " "
 
         # make text input

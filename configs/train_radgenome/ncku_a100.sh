@@ -64,6 +64,8 @@ lesion_pred_csv="${lesion_pred_csv:-}"
 lesion_order="${lesion_order:-truth}"
 # B3d: lesion_size_unit=cm writes '(~0.7cm)', the reports' own format (B3c = mm).
 lesion_size_unit="${lesion_size_unit:-mm}"
+# B3e: sizes in the report targets -> [SIZE], filled at inference from lesion_pred_csv.
+size_placeholder="${size_placeholder:-False}"
 
 # Outputs — inside the project directory, one directory per seed.
 # HF Trainer's _rotate_checkpoints sorts by mtime, not by step, so a second run
