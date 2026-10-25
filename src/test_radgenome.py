@@ -142,6 +142,7 @@ def main():
         lesion_pred_csv=data_args.lesion_pred_csv or None,
         lesion_order=data_args.lesion_order,
         lesion_size_unit=data_args.lesion_size_unit,
+        lesion_type=data_args.lesion_type,
     )
 
     Test_dataloader = DataLoader(
@@ -197,7 +198,7 @@ def main():
         row = [acc_num, question, gt_combined_report, pred_combined_report]
         if data_args.size_placeholder:
             r2a = region2area[0] if isinstance(region2area, (list, tuple)) else region2area
-            preds_by_area = {area: [mm for _, mm in Test_dataset.nodule_index.get((acc_num, area), [])]
+            preds_by_area = {area: [mm for _, mm, _ in Test_dataset.nodule_index.get((acc_num, area), [])]
                              for area in r2a.values()}
             filled, n_slots, n_unfilled = fill_report(pred_combined_report, r2a, preds_by_area)
             print('Pred_filled: ', filled, f'({n_slots} size slots, {n_unfilled} unfilled)')

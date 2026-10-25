@@ -1,23 +1,33 @@
 #!/bin/bash
-# Encoder-only comparison of lesion poolings (evaluation/train_lesion_encoder.py).
-# First run builds a ~1.3 GB crop cache in outputs/ (~11 min); later runs reuse it.
-#   bash scripts/train_lesion_encoder.sh             # gap, center, attn in sequence
-#   ARCHS="center" EPOCHS=60 bash scripts/train_lesion_encoder.sh
+# Encoder-only training / ablation (evaluation/train_lesion_encoder.py).
+# First run builds a ~1.3 GB crop cache in outputs/ (~11 min); later runs reuse it,
+# and outputs/nodule_type.csv (type labels, data_prep/build_nodule_type.py) is built if missing.
+#   bash scripts/train_lesion_encoder.sh                          # attn: none, ce, ce_mil
+#   ARCHS="gap center attn" TYPE_LOSSES=none bash scripts/train_lesion_encoder.sh   # the pooling comparison
+#   TYPE_LOSSES=ce_mil W_MIL=1.0 bash scripts/train_lesion_encoder.sh
 set -eu
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 export PYTHONWARNINGS=ignore
 VENV="${VENV:-/root/notebooks/automl/env}"
 PY="$VENV/bin/python"
 DATA_ROOT="${DATA_ROOT:-/root/notebooks/groups/BME/reg2rg_nifti}"
-ARCHS="${ARCHS:-gap center attn}"
+ARCHS="${ARCHS:-attn}"
+TYPE_LOSSES="${TYPE_LOSSES:-none ce ce_mil}"
 EPOCHS="${EPOCHS:-40}"
 SEED="${SEED:-0}"
+W_TYPE="${W_TYPE:-1.0}"
+W_MIL="${W_MIL:-0.5}"
+MIL_WARMUP="${MIL_WARMUP:-10}"
 mkdir -p outputs/seed_sweep_logs
 for arch in $ARCHS; do
-    log="outputs/seed_sweep_logs/lesion_enc_${arch}_seed${SEED}.log"
-    echo "=== $arch -> $log"
+  for tl in $TYPE_LOSSES; do
+    sfx=$([ "$tl" = none ] && echo "" || echo "_$tl")
+    log="outputs/seed_sweep_logs/lesion_enc_${arch}${sfx}_seed${SEED}.log"
+    echo "=== $arch type_loss=$tl -> $log"
     CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" "$PY" evaluation/train_lesion_encoder.py \
-        --arch "$arch" --data_root "$DATA_ROOT" --epochs "$EPOCHS" --seed "$SEED" 2>&1 | tee "$log"
+        --arch "$arch" --type_loss "$tl" --data_root "$DATA_ROOT" --epochs "$EPOCHS" --seed "$SEED" \
+        --w_type "$W_TYPE" --w_mil "$W_MIL" --mil_warmup "$MIL_WARMUP" 2>&1 | tee "$log"
+  done
 done
 echo
 echo "=== summary"

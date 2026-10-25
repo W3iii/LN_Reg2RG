@@ -53,6 +53,7 @@ lesion_pred_csv="${lesion_pred_csv:-}"
 lesion_order="${lesion_order:-truth}"
 lesion_size_unit="${lesion_size_unit:-mm}"
 size_placeholder="${size_placeholder:-False}"
+lesion_type="${lesion_type:-False}"
 
 # Results — tagged by split, checkpoint, and run_tag so runs do not overwrite (or
 # get silently skipped against) each other. test_radgenome.py appends and skips

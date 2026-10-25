@@ -35,4 +35,7 @@ class DataArguments:
     # B3e: sizes in the report targets become '[SIZE]' (src/size_placeholder.py);
     # at inference they are filled from lesion_pred_csv. Needs lesion_pred_csv.
     size_placeholder: bool = field(default=False)
+    # B3f: also write the encoder's predicted nodule type into the prompt,
+    # '<lesionK> (~0.6cm, GGO)'. Needs a lesion_pred_csv with a pred_type column.
+    lesion_type: bool = field(default=False)
     result_path: Optional[str] = field(default='/home/chenzhixuan/Workspace/Reg2RG/results/radgenome_combined_reports.csv')

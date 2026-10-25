@@ -66,6 +66,9 @@ lesion_order="${lesion_order:-truth}"
 lesion_size_unit="${lesion_size_unit:-mm}"
 # B3e: sizes in the report targets -> [SIZE], filled at inference from lesion_pred_csv.
 size_placeholder="${size_placeholder:-False}"
+# B3f: predicted nodule type in the prompt too, '<lesionK> (~0.6cm, GGO)'. Needs the
+#   lesion_pred_<arch>_ce_mil csv and its _full.pt as lesion_encoder_ckpt.
+lesion_type="${lesion_type:-False}"
 
 # Outputs — inside the project directory, one directory per seed.
 # HF Trainer's _rotate_checkpoints sorts by mtime, not by step, so a second run

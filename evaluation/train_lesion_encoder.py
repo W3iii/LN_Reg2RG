@@ -1,4 +1,4 @@
-"""Train the lesion encoder alone (no LLM) on size + TW_Lung_RADS, compare poolings.
+"""Train the lesion encoder alone (no LLM) on size + TW_Lung_RADS (+ nodule type), compare poolings.
 
 Motivation (scripts/probe_lesion.sh, B2 seed 1, val):
 
@@ -25,7 +25,29 @@ This script tests both fixes before paying for another 4.5 h LLM run:
 All three emit the same 4096-d token, and the auxiliary heads sit on that token,
 so whatever is learned is in the vector the LLM would receive.
 
-Losses: smooth-L1 on log(eq_diam_mm) + class-weighted CE on TW_Lung_RADS.
+Losses
+    L = SmoothL1(log size)                       all nodules
+      + w_rads * CE_w(TW_Lung_RADS)              all nodules
+      + w_type * L_type                          nodules whose own report text names a type
+      + w_mil  * L_mil                           lobes whose text names a type no labelled
+                                                 nodule explains (after --mil_warmup epochs)
+
+Type labels come from data_prep/build_nodule_type.py and are *sets*: {GGO} is a hard
+label, {GGO, part-solid} ('subsolid') a partial one. "The report does not say" is
+never a negative.
+
+    L_type = weighted mean over labelled nodules of  -log sum_{t in S_i} p_i(t)
+             (= ordinary CE when S_i has one type; unlabelled nodules contribute 0,
+              and the mean is over labelled nodules only, so sparse labels are not diluted)
+    L_mil  = weighted mean over (lobe bag B, mentioned set M) of
+             -log P(at least one nodule of B is in M),  P = 1 - prod_{i in B} (1 - sum_{t in M} p_i(t))
+             (noisy-OR; only what the text says is used, never what it leaves out)
+
+Class weights 1/sqrt(freq) on the hard labels, normalised to mean 1 over them.
+Batches are built from whole lobe bags so every MIL bag is complete in one batch.
+
+--type_loss none | ce | ce_mil  selects the ablation arm (none = the B3e encoder).
+
 Train on the train split, select on val, report val. Test is never touched.
 
 Crops are cached once (outputs/, git-ignored): reading 1258 NIfTI took ~11 min.
@@ -42,15 +64,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import spearmanr
-from sklearn.metrics import cohen_kappa_score, roc_auc_score
+from sklearn.metrics import cohen_kappa_score, f1_score, roc_auc_score
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', 'src'))
+sys.path.insert(0, os.path.join(HERE, '..', 'data_prep'))
 sys.path.insert(0, HERE)
 
 from Model.my_embedding_layer import LesionEncoder, PooledLesionEncoder  # noqa: E402  (single source: MyEmbedding loads these state_dicts)
 from lesion_utils import crop_lesion, normalize_lesion, BBOX_COLS  # noqa: E402
 from extract_lesion_features import find_image                    # noqa: E402
+from build_nodule_type import TYPES, build as build_type_labels   # noqa: E402
+
+N_TYPES = len(TYPES)
+DEFAULT_TYPE_CSV = os.path.join(HERE, '..', 'outputs', 'nodule_type.csv')
 
 
 # ------------------------------------------------------------------ data
@@ -76,9 +103,60 @@ def build_cache(data_root, meta_csv, cache, splits=('train', 'val')):
     print(f'wrote {cache} {X.shape} ({X.nbytes/1e9:.2f} GB)')
 
 
+class TypeTargets:
+    """Type supervision aligned to the rows of the crop cache.
+
+    tset   [N, 4] float, multi-hot allowed types (all zero = no label)
+    hard   [N] int, the type when tset has exactly one, else -1
+    bag    [N] int, MIL bag id (-1 = none); bags never cross lobes, so never cross patients
+    ments  {bag_id: [N_TYPES]-float masks}, the type sets the lobe text names
+    """
+
+    def __init__(self, meta, type_csv, data_root=None):
+        if not os.path.exists(type_csv):
+            if data_root is None:
+                raise FileNotFoundError(type_csv)
+            print(f'[type] {type_csv} missing, building it from {data_root}')
+            build_type_labels(data_root, type_csv)
+        t = pd.read_csv(type_csv, keep_default_na=False)
+        if t.duplicated(['Volumename', 'nodule_id']).any():
+            raise ValueError(f'{type_csv}: duplicate (Volumename, nodule_id)')
+        t = t.drop(columns=[c for c in ('split', 'lobe') if c in t.columns])
+        m = meta[['Volumename', 'nodule_id']].merge(t, on=['Volumename', 'nodule_id'], how='left', validate='one_to_one')
+        if m['type_set'].isna().any():
+            raise ValueError(f'{type_csv} has no row for {int(m.type_set.isna().sum())} cached nodules; rebuild it')
+        idx = {n: i for i, n in enumerate(TYPES)}
+        self.tset = np.zeros((len(m), N_TYPES), dtype=np.float32)
+        for r, s in enumerate(m['type_set']):
+            for n in filter(None, str(s).split('|')):
+                self.tset[r, idx[n]] = 1
+        self.hard = np.where(self.tset.sum(1) == 1, self.tset.argmax(1), -1).astype(np.int64)
+        self.bag = m['bag_id'].astype(int).to_numpy()
+        self.ments = {}
+        for b, ms in m.loc[self.bag >= 0, ['bag_id', 'bag_mentions']].drop_duplicates('bag_id').itertuples(index=False):
+            masks = []
+            for s in ms.split(';'):
+                v = np.zeros(N_TYPES, dtype=np.float32)
+                for n in s.split('|'):
+                    v[idx[n]] = 1
+                masks.append(v)
+            self.ments[int(b)] = masks
+
+    def class_weights(self, idx):
+        """1/sqrt(freq) over the hard labels in idx, normalised to mean 1 over them."""
+        h = self.hard[idx]
+        n = np.bincount(h[h >= 0], minlength=N_TYPES).astype(np.float64)
+        w = 1.0 / np.sqrt(n.clip(1))
+        w /= (n * w).sum() / max(n.sum(), 1)
+        return w.astype(np.float32)
+
+
 class Crops(torch.utils.data.Dataset):
-    def __init__(self, X, logd, rads, augment):
+    """Returns (crop, log diam, rads, row) -- row indexes the cache, for type targets."""
+
+    def __init__(self, X, logd, rads, augment, rows=None):
         self.X, self.logd, self.rads, self.augment = X, logd, rads, augment
+        self.rows = np.arange(len(X)) if rows is None else np.asarray(rows)
 
     def __len__(self):
         return len(self.X)
@@ -91,7 +169,56 @@ class Crops(torch.utils.data.Dataset):
                     x = np.flip(x, ax)
             sy, sx, sz = np.random.randint(-2, 3, 3)  # small jitter; the nodule stays central
             x = np.roll(x, (sy, sx, int(sz) // 2), axis=(0, 1, 2))
-        return torch.from_numpy(np.ascontiguousarray(x))[None], self.logd[i], self.rads[i]
+        return torch.from_numpy(np.ascontiguousarray(x))[None], self.logd[i], self.rads[i], int(self.rows[i])
+
+
+class BagBatchSampler(torch.utils.data.Sampler):
+    """Shuffled batches of ~bs crops that never split a MIL bag.
+
+    Units are whole bags or single nodules; units are shuffled and packed until a
+    batch reaches bs. The last batch is dropped when it is under half full.
+    """
+
+    def __init__(self, bag, bs, seed=0):
+        self.bs = bs
+        self.rng = np.random.default_rng(seed)
+        units = {}
+        for i, b in enumerate(bag):
+            units.setdefault(('b', int(b)) if b >= 0 else ('n', i), []).append(i)
+        self.units = list(units.values())
+
+    def _batches(self, order):
+        batch = []
+        for u in order:
+            batch.extend(self.units[u])
+            if len(batch) >= self.bs:
+                yield batch
+                batch = []
+        if len(batch) >= self.bs // 2:
+            yield batch
+
+    def __iter__(self):
+        return self._batches(self.rng.permutation(len(self.units)))
+
+    def __len__(self):
+        # exact for the identity order; a shuffled epoch differs by at most a batch or so
+        return sum(1 for _ in self._batches(range(len(self.units))))
+
+
+def train_loader(X, logd, rads, idx, bag, bs, workers, seed):
+    ds = Crops(np.asarray(X[idx]), logd[idx], rads[idx], True, rows=idx)
+    return torch.utils.data.DataLoader(ds, batch_sampler=BagBatchSampler(bag[idx], bs, seed), num_workers=workers)
+
+
+def one_cycle(opt, lr, epochs, dl):
+    # +2 per epoch: a shuffled epoch can pack a batch more than len() counts, and
+    # OneCycleLR raises if stepped past total_steps; the unused tail is ~0.1% of steps
+    return torch.optim.lr_scheduler.OneCycleLR(opt, lr, total_steps=epochs * (len(dl) + 2))
+
+
+def eval_loader(X, logd, rads, idx, bs, workers=0):
+    return torch.utils.data.DataLoader(Crops(np.asarray(X[idx]), logd[idx], rads[idx], False, rows=idx),
+                                       batch_size=bs, shuffle=False, num_workers=workers)
 
 
 # ------------------------------------------------------------------ models
@@ -101,30 +228,146 @@ class Net(nn.Module):
         self.enc = LesionEncoder(dim=4096) if arch == 'gap' else PooledLesionEncoder(arch)
         self.size_head = nn.Sequential(nn.LayerNorm(4096), nn.Linear(4096, 1))
         self.rads_head = nn.Sequential(nn.LayerNorm(4096), nn.Linear(4096, 4))
+        self.type_head = nn.Sequential(nn.LayerNorm(4096), nn.Linear(4096, N_TYPES))
 
     def forward(self, x):
         t = self.enc(x)
-        return self.size_head(t)[:, 0], self.rads_head(t), t
+        return self.size_head(t)[:, 0], self.rads_head(t), self.type_head(t), t
+
+
+def checkpoint(model, arch, metrics, **extra):
+    return {'arch': arch, 'encoder': model.enc.state_dict(),
+            'size_head': model.size_head.state_dict(), 'rads_head': model.rads_head.state_dict(),
+            'type_head': model.type_head.state_dict(), 'type_names': list(TYPES),
+            'metrics': {k: float(v) for k, v in metrics.items() if np.isscalar(v)}, **extra}
+
+
+# ------------------------------------------------------------------ losses
+def type_loss(type_logits, tset, cw):
+    """Partial-label CE: -log sum_{t in S_i} p_i(t), class-weighted mean over labelled rows only."""
+    lab = tset.sum(1) > 0
+    if not lab.any():
+        return type_logits.sum() * 0.0
+    logp = F.log_softmax(type_logits[lab].float(), 1)
+    s = tset[lab]
+    lp = torch.logsumexp(logp.masked_fill(s == 0, float('-inf')), 1)
+    w = (s * cw).sum(1) / s.sum(1)
+    return -(w * lp).sum() / w.sum()
+
+
+def mil_loss(type_logits, bag, ments, cw):
+    """Noisy-OR over each lobe bag: -log(1 - prod_i (1 - P(nodule i is in M))), per mentioned set M."""
+    p = F.softmax(type_logits.float(), 1)
+    losses, weights = [], []
+    for b in torch.unique(bag[bag >= 0]).tolist():
+        pb = p[bag == b]
+        for M in ments[b]:
+            M = torch.as_tensor(M, device=p.device)
+            q = (pb * M).sum(1).clamp(0.0, 1.0 - 1e-6)           # P(nodule i is one of M)
+            log_none = torch.log1p(-q).sum().clamp(max=-1e-6)     # log P(no nodule of the bag is in M)
+            losses.append(-torch.log(-torch.expm1(log_none)))      # -log P(at least one is)
+            weights.append((M * cw).sum() / M.sum())
+    if not losses:
+        return type_logits.sum() * 0.0
+    w = torch.stack(weights)
+    return (w * torch.stack(losses)).sum() / w.sum()
+
+
+class Objective:
+    """The full Stage-1 loss; shared by this script and predict_lesion_attributes.py."""
+
+    def __init__(self, a, rads_train, tt, idx, device):
+        self.a, self.tt, self.device = a, tt, device
+        self.cw_rads = torch.tensor(len(idx) / (4 * np.bincount(rads_train, minlength=4).clip(1)), dtype=torch.float32, device=device)
+        self.cw_type = torch.tensor(tt.class_weights(idx), device=device)
+        self.tset = torch.tensor(tt.tset, device=device)
+        self.bag = torch.tensor(tt.bag, device=device)
+
+    def __call__(self, out, ld, r, rows, epoch):
+        s, rl, tl, _ = out
+        a = self.a
+        parts = {'size': F.smooth_l1_loss(s.float(), ld, beta=0.1),
+                 'rads': F.cross_entropy(rl.float(), r, weight=self.cw_rads)}
+        loss = parts['size'] + a.w_rads * parts['rads']
+        if a.type_loss in ('ce', 'ce_mil'):
+            parts['type'] = type_loss(tl, self.tset[rows], self.cw_type)
+            loss = loss + a.w_type * parts['type']
+        if a.type_loss == 'ce_mil' and epoch >= a.mil_warmup:
+            parts['mil'] = mil_loss(tl, self.bag[rows], self.tt.ments, self.cw_type)
+            loss = loss + a.w_mil * parts['mil']
+        return loss, {k: v.item() for k, v in parts.items()}
+
+
+def add_loss_args(ap):
+    ap.add_argument('--type_loss', choices=['none', 'ce', 'ce_mil'], default='ce_mil',
+                    help='none = size + RADS only (the B3e encoder); ce = + nodule-level type; ce_mil = + lobe-level MIL')
+    ap.add_argument('--type_csv', default=DEFAULT_TYPE_CSV, help='data_prep/build_nodule_type.py output (built if missing)')
+    ap.add_argument('--w_rads', type=float, default=1.0)
+    ap.add_argument('--w_type', type=float, default=1.0)
+    ap.add_argument('--w_mil', type=float, default=0.5)
+    ap.add_argument('--mil_warmup', type=int, default=10, help='epochs before L_mil is switched on')
 
 
 # ------------------------------------------------------------------ eval
 @torch.no_grad()
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, tt=None):
     model.eval()
-    P, L, Y, R = [], [], [], []
-    for x, logd, rads in loader:
+    P, L, T, Y, R, rows = [], [], [], [], [], []
+    for x, logd, rads, row in loader:
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=device.type == 'cuda'):
-            s, r, _ = model(x.to(device))
-        P.append(s.float().cpu()); L.append(F.softmax(r.float(), 1).cpu()); Y.append(logd); R.append(rads)
-    P, L, Y, R = (torch.cat(v).numpy() for v in (P, L, Y, R))
+            s, r, t, _ = model(x.to(device))
+        P.append(s.float().cpu()); L.append(F.softmax(r.float(), 1).cpu()); T.append(F.softmax(t.float(), 1).cpu())
+        Y.append(logd); R.append(rads); rows.append(row)
+    P, L, T, Y, R, rows = (torch.cat(v).numpy() for v in (P, L, T, Y, R, rows))
     d, dhat = np.exp(Y), np.exp(P)
     big = d >= 6
     rads1 = R + 1
     pred = L.argmax(1) + 1
-    return dict(rho=spearmanr(d, dhat).statistic, MAE=float(np.abs(dhat - d).mean()),
-                MAE_ge6=float(np.abs(dhat - d)[big].mean()),
-                kappa=cohen_kappa_score(rads1, pred, weights='quadratic'),
-                auc_ge3=roc_auc_score(rads1 >= 3, L[:, 2:].sum(1)), acc=float((pred == rads1).mean()))
+    m = dict(rho=spearmanr(d, dhat).statistic, MAE=float(np.abs(dhat - d).mean()),
+             MAE_ge6=float(np.abs(dhat - d)[big].mean()),
+             kappa=cohen_kappa_score(rads1, pred, weights='quadratic'),
+             auc_ge3=roc_auc_score(rads1 >= 3, L[:, 2:].sum(1)), acc=float((pred == rads1).mean()))
+    if tt is not None:
+        m.update(type_metrics(T, rows, tt))
+    return m
+
+
+def type_metrics(T, rows, tt):
+    """Hard-labelled nodules: acc, macro-F1 / balanced acc over the classes present, per-class recall.
+    MIL bags: share of (bag, mention) pairs where some member's argmax is in the mentioned set."""
+    m = {}
+    h = tt.hard[rows]
+    lab = h >= 0
+    tp = T.argmax(1)
+    if lab.any():
+        present = sorted(set(h[lab].tolist()))
+        m['type_n'] = int(lab.sum())
+        m['type_acc'] = float((tp[lab] == h[lab]).mean())
+        m['type_f1'] = float(f1_score(h[lab], tp[lab], labels=present, average='macro', zero_division=0))
+        rec = [float((tp[lab & (h == c)] == c).mean()) for c in present]
+        m['type_bacc'] = float(np.mean(rec))
+        for c, rc in zip(present, rec):
+            m[f'recall_{TYPES[c]}'] = rc
+            m[f'n_{TYPES[c]}'] = int((h[lab] == c).sum())
+    bag = tt.bag[rows]
+    hits = []
+    for b in np.unique(bag[bag >= 0]):
+        mem = tp[bag == b]
+        for M in tt.ments[int(b)]:
+            hits.append(bool(M[mem].any()))
+    if hits:
+        m['bag_hit'] = float(np.mean(hits)); m['bag_n'] = len(hits)
+    return m
+
+
+def fmt_type(m):
+    if 'type_f1' not in m:
+        return ''
+    rec = ' '.join(f'{t}:{m[f"recall_{t}"]:.2f}' for t in TYPES if f'recall_{t}' in m)
+    s = f' | type F1 {m["type_f1"]:.3f} bacc {m["type_bacc"]:.3f} (n={m["type_n"]}; {rec})'
+    if 'bag_hit' in m:
+        s += f' bag-hit {m["bag_hit"]:.2f}'
+    return s
 
 
 def main():
@@ -135,7 +378,7 @@ def main():
     ap.add_argument('--epochs', type=int, default=40)
     ap.add_argument('--bs', type=int, default=64)
     ap.add_argument('--lr', type=float, default=3e-4)
-    ap.add_argument('--w_rads', type=float, default=1.0)
+    add_loss_args(ap)
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--out', default=None, help='dir for best.pt + metrics.json')
     ap.add_argument('--workers', type=int, default=4)
@@ -149,51 +392,56 @@ def main():
     rads = (meta['tw_lung_rads'].to_numpy(np.int64) - 1)
     tr = np.flatnonzero(meta['split'].to_numpy() == 'train')
     va = np.flatnonzero(meta['split'].to_numpy() == 'val')
-    print(f'arch={a.arch}  train={len(tr)}  val={len(va)}  val patients={meta.pid.iloc[va].nunique()}')
+    tt = TypeTargets(meta, a.type_csv, a.data_root)
+    print(f'arch={a.arch}  type_loss={a.type_loss}  train={len(tr)}  val={len(va)}  val patients={meta.pid.iloc[va].nunique()}')
+    print(f'[type] train: {int((tt.hard[tr] >= 0).sum())} hard, {int(((tt.tset[tr].sum(1) > 1)).sum())} partial, '
+          f'{int((tt.bag[tr] >= 0).sum())} in {len(np.unique(tt.bag[tr][tt.bag[tr] >= 0]))} MIL bags; '
+          f'class weights {dict(zip(TYPES, tt.class_weights(tr).round(2).tolist()))}')
 
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'device={device}' + (f' ({torch.cuda.get_device_name(0)})' if device.type == 'cuda' else '  <-- no GPU visible, this will be slow'))
-    mk = lambda idx, aug, sh: torch.utils.data.DataLoader(
-        Crops(np.asarray(X[idx]), logd[idx], rads[idx], aug),
-        batch_size=a.bs, shuffle=sh, num_workers=a.workers, drop_last=sh)
-    dl_tr, dl_va = mk(tr, True, True), mk(va, False, False)
+    dl_tr = train_loader(X, logd, rads, tr, tt.bag, a.bs, a.workers, a.seed)
+    dl_va = eval_loader(X, logd, rads, va, a.bs, a.workers)
 
     model = Net(a.arch).to(device)
-    cw = torch.tensor(len(tr) / (4 * np.bincount(rads[tr], minlength=4).clip(1)), dtype=torch.float32, device=device)
+    obj = Objective(a, rads[tr], tt, tr, device)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-2)
-    sched = torch.optim.lr_scheduler.OneCycleLR(opt, a.lr, total_steps=a.epochs * len(dl_tr))
-    out = a.out or os.path.join(HERE, '..', 'outputs', f'lesion_enc_{a.arch}_seed{a.seed}')
+    sched = one_cycle(opt, a.lr, a.epochs, dl_tr)
+    suffix = '' if a.type_loss == 'none' else f'_{a.type_loss}'
+    out = a.out or os.path.join(HERE, '..', 'outputs', f'lesion_enc_{a.arch}{suffix}_seed{a.seed}')
     os.makedirs(out, exist_ok=True)
 
     best, best_score, hist = None, -1e9, []
     for ep in range(a.epochs):
-        model.train(); t0 = time.time(); tot = 0.0
-        for x, ld, r in dl_tr:
-            x, ld, r = x.to(device), ld.to(device), r.to(device)
+        model.train(); t0 = time.time(); tot = 0.0; parts = {}; nb = 0
+        for x, ld, r, rows in dl_tr:
+            x, ld, r, rows = x.to(device), ld.to(device), r.to(device), rows.to(device)
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=device.type == 'cuda'):
-                s, logits, _ = model(x)
-            loss = F.smooth_l1_loss(s.float(), ld, beta=0.1) + a.w_rads * F.cross_entropy(logits.float(), r, weight=cw)
+                o = model(x)
+            loss, p = obj(o, ld, r, rows, ep)
             opt.zero_grad(set_to_none=True); loss.backward(); opt.step(); sched.step()
-            tot += loss.item()
-        m = evaluate(model, dl_va, device)
-        m.update(epoch=ep + 1, train_loss=tot / len(dl_tr))
+            tot += loss.item(); nb += 1
+            for k, v in p.items():
+                parts[k] = parts.get(k, 0.0) + v
+        m = evaluate(model, dl_va, device, tt)
+        m.update(epoch=ep + 1, train_loss=tot / nb, **{f'loss_{k}': v / nb for k, v in parts.items()})
         hist.append(m)
-        score = m['rho'] + m['kappa']           # model selection on val, both targets equally
+        # model selection on val; the type term only once type is being trained
+        score = m['rho'] + m['kappa'] + (m.get('type_f1', 0.0) if a.type_loss != 'none' else 0.0)
         flag = ''
         if score > best_score:
             best_score, best = score, m
-            torch.save({'arch': a.arch, 'encoder': model.enc.state_dict(),
-                        'size_head': model.size_head.state_dict(), 'rads_head': model.rads_head.state_dict(),
-                        'metrics': {k: float(v) for k, v in m.items()}}, os.path.join(out, 'best.pt'))
+            torch.save(checkpoint(model, a.arch, m, type_loss=a.type_loss), os.path.join(out, 'best.pt'))
             flag = ' *'
-        print(f'ep {ep+1:3d} loss {m["train_loss"]:.3f} | val rho {m["rho"]:.3f} MAE(>=6) {m["MAE_ge6"]:.2f} '
-              f'kappa {m["kappa"]:.3f} AUC>=3 {m["auc_ge3"]:.3f} | {time.time()-t0:.0f}s{flag}', flush=True)
+        lp = ' '.join(f'{k} {v / nb:.3f}' for k, v in parts.items())
+        print(f'ep {ep+1:3d} loss {m["train_loss"]:.3f} ({lp}) | val rho {m["rho"]:.3f} MAE(>=6) {m["MAE_ge6"]:.2f} '
+              f'kappa {m["kappa"]:.3f} AUC>=3 {m["auc_ge3"]:.3f}{fmt_type(m)} | {time.time()-t0:.0f}s{flag}', flush=True)
 
     json.dump({'best': best, 'history': hist, 'args': vars(a)}, open(os.path.join(out, 'metrics.json'), 'w'), indent=1, default=float)
-    print(f'\nBEST arch={a.arch}: rho {best["rho"]:.3f}  MAE {best["MAE"]:.2f}  MAE(>=6) {best["MAE_ge6"]:.2f}  '
-          f'kappa {best["kappa"]:.3f}  AUC>=3 {best["auc_ge3"]:.3f}  (epoch {best["epoch"]})')
-    print('reference (probe, val): token B2 rho 0.175 / kappa 0.112; HU stats 0.719 / 0.613; mask-size kappa 0.683')
+    print(f'\nBEST arch={a.arch} type_loss={a.type_loss}: rho {best["rho"]:.3f}  MAE {best["MAE"]:.2f}  MAE(>=6) {best["MAE_ge6"]:.2f}  '
+          f'kappa {best["kappa"]:.3f}  AUC>=3 {best["auc_ge3"]:.3f}{fmt_type(best)}  (epoch {best["epoch"]})')
+    print('reference (val): attn size+RADS only rho 0.805 / kappa 0.694; report-text GGO recall of B3e_clean 0.18')
 
 
 if __name__ == '__main__':

@@ -28,8 +28,8 @@ LESION_CROP_SIZE = (64, 64, 32)
 BBOX_COLS = ['y0_crop', 'y1_crop', 'x0_crop', 'x1_crop', 'z0_crop', 'z1_crop']
 
 
-def load_nodule_index(csv_path, max_per_region=None, pred_csv=None, order='truth'):
-    """(Volumename, region) -> [(box, pred_mm), ...], first = the one to lead with.
+def load_nodule_index(csv_path, max_per_region=None, pred_csv=None, order='truth', with_type=False):
+    """(Volumename, region) -> [(box, pred_mm, pred_type), ...], first = the one to lead with.
 
     order='truth'  rank by tw_lung_rads then eq_diam_mm, both descending (B2/B3a).
                    Both are ground truth, so at inference the *position* of a
@@ -45,6 +45,10 @@ def load_nodule_index(csv_path, max_per_region=None, pred_csv=None, order='truth
     Dataset writes into the prompt as "<lesionK> (~X mm)"; otherwise pred_mm is
     None and the prompt is byte-identical to B2/B3a.
 
+    with_type=True (B3f) also reads pred_csv's pred_type column (GGO / solid /
+    part-solid / calcified, cross-fitted like the sizes) and the prompt becomes
+    "<lesionK> (~0.6cm, GGO)". Otherwise pred_type is None and nothing changes.
+
     Overflow (>max_per_region in a lobe) keeps the first ones under the chosen
     order. Only 15 of 3144 (patient, lobe) pairs have more than 8, and the lobe's
     report text still describes every nodule, so overflow costs visual detail,
@@ -54,6 +58,8 @@ def load_nodule_index(csv_path, max_per_region=None, pred_csv=None, order='truth
         raise ValueError(f"order must be 'truth' or 'pred', got {order!r}")
     if order == 'pred' and not pred_csv:
         raise ValueError("order='pred' needs pred_csv")
+    if with_type and not pred_csv:
+        raise ValueError('with_type needs pred_csv (a lesion_pred_<arch>_<type_loss> file)')
     df = pd.read_csv(csv_path)
 
     missing = [c for c in BBOX_COLS + ['Volumename', 'region'] if c not in df.columns]
@@ -68,16 +74,24 @@ def load_nodule_index(csv_path, max_per_region=None, pred_csv=None, order='truth
             df[c] = 0.0
 
     df['pred_mm'] = np.nan
+    df['pred_type'] = None
     if pred_csv:
-        p = pd.read_csv(pred_csv)[['Volumename', 'nodule_id', 'pred_diam_mm']]
+        p = pd.read_csv(pred_csv)
+        if with_type and 'pred_type' not in p.columns:
+            raise ValueError(f'{pred_csv} has no pred_type column: make it with '
+                             f'predict_lesion_attributes.py --type_loss ce|ce_mil')
+        p = p[['Volumename', 'nodule_id', 'pred_diam_mm'] + (['pred_type'] if with_type else [])]
         if p.duplicated(['Volumename', 'nodule_id']).any():
             raise ValueError(f'{pred_csv}: duplicate (Volumename, nodule_id) rows')
-        df = df.drop(columns='pred_mm').merge(p, on=['Volumename', 'nodule_id'], how='left')
+        df = df.drop(columns=['pred_mm'] + (['pred_type'] if with_type else [])).merge(
+            p, on=['Volumename', 'nodule_id'], how='left')
         df = df.rename(columns={'pred_diam_mm': 'pred_mm'})
         n_miss = int(df['pred_mm'].isna().sum())
         if n_miss:
             raise ValueError(f'{pred_csv} has no prediction for {n_miss} of {len(df)} nodules '
                              f'in {csv_path}; regenerate it from the same nodule_metadata.csv')
+        if with_type and df['pred_type'].isna().any():
+            raise ValueError(f'{pred_csv}: pred_type missing for {int(df.pred_type.isna().sum())} nodules')
 
     if order == 'truth':
         df = df.sort_values(['tw_lung_rads', 'eq_diam_mm'], ascending=False)
@@ -91,27 +105,33 @@ def load_nodule_index(csv_path, max_per_region=None, pred_csv=None, order='truth
         index[(str(vol), str(region))] = [
             ((int(r.y0_crop), int(r.y1_crop), int(r.x0_crop),
               int(r.x1_crop), int(r.z0_crop), int(r.z1_crop)),
-             None if pd.isna(r.pred_mm) else float(r.pred_mm))
+             None if pd.isna(r.pred_mm) else float(r.pred_mm),
+             None if pd.isna(r.pred_type) else str(r.pred_type))
             for r in grp.itertuples()
         ]
     return index
 
 
-def lesion_token_text(slot, pred_mm, unit='mm'):
-    """'<lesion12>', or with a predicted size '<lesion12> (~7 mm)' / '<lesion12> (~0.7cm)'.
+def lesion_token_text(slot, pred_mm, unit='mm', pred_type=None):
+    """'<lesion12>', or with a predicted size '<lesion12> (~7 mm)' / '<lesion12> (~0.7cm)',
+    and with a predicted type too '<lesion12> (~0.7cm, GGO)' (B3f).
 
     unit='cm' writes the size the way ~79% of the reports do ('about 0.7cm'), so
     the LLM can copy it verbatim. With 'mm' (B3c) the model had to convert units
     itself and got it wrong often enough to matter -- e.g. '(~4 mm)' came out as
     '5.5cm' (CHESTCT0915, val).
     """
-    if pred_mm is None:
+    if unit not in ('mm', 'cm'):
+        raise ValueError(f"unit must be 'mm' or 'cm', got {unit!r}")
+    parts = []
+    if pred_mm is not None:
+        parts.append(f'~{max(0.1, round(pred_mm / 10.0, 1)):.1f}cm' if unit == 'cm'
+                     else f'~{max(1, int(round(pred_mm)))} mm')
+    if pred_type is not None:
+        parts.append(pred_type)
+    if not parts:
         return f'<lesion{slot}>'
-    if unit == 'cm':
-        return f'<lesion{slot}> (~{max(0.1, round(pred_mm / 10.0, 1)):.1f}cm)'
-    if unit == 'mm':
-        return f'<lesion{slot}> (~{max(1, int(round(pred_mm)))} mm)'
-    raise ValueError(f"unit must be 'mm' or 'cm', got {unit!r}")
+    return f'<lesion{slot}> ({", ".join(parts)})'
 
 def crop_lesion(img, bbox, size=LESION_CROP_SIZE):
     """Crop `img` at `bbox`, centred in a fixed-size zero-padded array.
