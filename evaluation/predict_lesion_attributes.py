@@ -25,7 +25,7 @@ No model selection on val anywhere here: every fit runs a fixed number of epochs
 and keeps the last weights (OneCycle ends at a low LR; the val-selected best
 epochs were 34-38 of 40 anyway). Test labels are never read.
 
-Outputs (<tag> = <arch> for --type_loss none, the B3e file; else <arch>_<type_loss>)
+Outputs (<tag> = <arch>_<type_loss>; the B3e file lesion_pred_<arch>_seed<seed>.csv is never rewritten)
   outputs/lesion_pred_<tag>_seed<seed>.csv       one row per nodule, all splits
   outputs/lesion_pred_<tag>_seed<seed>_full.pt   encoder + heads fitted on all train
                                                  (MyEmbedding-loadable, like best.pt)
@@ -111,7 +111,9 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'arch={a.arch} type_loss={a.type_loss} device={device}  train={len(tr)} val={len(va)} test={len(te)}  folds={a.folds}')
 
-    tag = a.arch if a.type_loss == 'none' else f'{a.arch}_{a.type_loss}'
+    # type_loss always in the name: '--type_loss none' must not overwrite B3e's
+    # outputs/lesion_pred_<arch>_seed<seed>.csv, which B3e/B3e_clean inference still reads
+    tag = f'{a.arch}_{a.type_loss}'
     out = a.out or os.path.join(HERE, '..', 'outputs', f'lesion_pred_{tag}_seed{a.seed}.csv')
     pred_d = np.full(len(meta), np.nan)
     pred_p = np.full((len(meta), 4), np.nan)

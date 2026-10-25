@@ -3,6 +3,8 @@
 # First run builds a ~1.3 GB crop cache in outputs/ (~11 min); later runs reuse it,
 # and outputs/nodule_type.csv (type labels, data_prep/build_nodule_type.py) is built if missing.
 #   bash scripts/train_lesion_encoder.sh                          # attn: none, ce, ce_mil
+#     -> outputs/lesion_enc_attn_{none,ce,ce_mil}_seed0/best.pt (+ metrics.json)
+#        logs outputs/seed_sweep_logs/lesion_enc_attn_{none,ce,ce_mil}_seed0.log
 #   ARCHS="gap center attn" TYPE_LOSSES=none bash scripts/train_lesion_encoder.sh   # the pooling comparison
 #   TYPE_LOSSES=ce_mil W_MIL=1.0 bash scripts/train_lesion_encoder.sh
 set -eu
@@ -21,8 +23,8 @@ MIL_WARMUP="${MIL_WARMUP:-10}"
 mkdir -p outputs/seed_sweep_logs
 for arch in $ARCHS; do
   for tl in $TYPE_LOSSES; do
-    sfx=$([ "$tl" = none ] && echo "" || echo "_$tl")
-    log="outputs/seed_sweep_logs/lesion_enc_${arch}${sfx}_seed${SEED}.log"
+    log="outputs/seed_sweep_logs/lesion_enc_${arch}_${tl}_seed${SEED}.log"
+    LOGS="${LOGS:-} $log"
     echo "=== $arch type_loss=$tl -> $log"
     CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" "$PY" evaluation/train_lesion_encoder.py \
         --arch "$arch" --type_loss "$tl" --data_root "$DATA_ROOT" --epochs "$EPOCHS" --seed "$SEED" \
@@ -31,4 +33,4 @@ for arch in $ARCHS; do
 done
 echo
 echo "=== summary"
-grep -h "^BEST" outputs/seed_sweep_logs/lesion_enc_*_seed${SEED}.log
+grep -h "^BEST" $LOGS

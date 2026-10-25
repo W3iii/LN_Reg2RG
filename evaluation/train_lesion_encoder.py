@@ -408,8 +408,9 @@ def main():
     obj = Objective(a, rads[tr], tt, tr, device)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-2)
     sched = one_cycle(opt, a.lr, a.epochs, dl_tr)
-    suffix = '' if a.type_loss == 'none' else f'_{a.type_loss}'
-    out = a.out or os.path.join(HERE, '..', 'outputs', f'lesion_enc_{a.arch}{suffix}_seed{a.seed}')
+    # type_loss is always in the name, so the 'none' arm never overwrites the B3a encoder
+    # (outputs/lesion_enc_<arch>_seed<seed>/best.pt, trained before the type head existed)
+    out = a.out or os.path.join(HERE, '..', 'outputs', f'lesion_enc_{a.arch}_{a.type_loss}_seed{a.seed}')
     os.makedirs(out, exist_ok=True)
 
     best, best_score, hist = None, -1e9, []

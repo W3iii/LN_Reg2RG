@@ -2,7 +2,8 @@
 # Cross-fitted per-nodule size / RADS / type predictions (evaluation/predict_lesion_attributes.py).
 # First run builds a crop cache including test (~13 min); later runs reuse it.
 #   bash scripts/predict_lesion_attributes.sh                     # attn, ce_mil -> lesion_pred_attn_ce_mil_seed0.csv
-#   TYPE_LOSS=none bash scripts/predict_lesion_attributes.sh      # the B3e file, lesion_pred_attn_seed0.csv
+#     -> outputs/lesion_pred_attn_ce_mil_seed0.csv + _full.pt (B3f lesion_pred_csv / lesion_encoder_ckpt)
+#   TYPE_LOSS=none bash scripts/predict_lesion_attributes.sh      # -> lesion_pred_attn_none_seed0.csv (B3e file untouched)
 set -eu
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 export PYTHONWARNINGS=ignore
@@ -15,7 +16,7 @@ SEED="${SEED:-0}"
 W_TYPE="${W_TYPE:-1.0}"
 W_MIL="${W_MIL:-0.5}"
 MIL_WARMUP="${MIL_WARMUP:-10}"
-tag=$([ "$TYPE_LOSS" = none ] && echo "$ARCH" || echo "${ARCH}_${TYPE_LOSS}")
+tag="${ARCH}_${TYPE_LOSS}"
 mkdir -p outputs/seed_sweep_logs
 log="outputs/seed_sweep_logs/lesion_pred_${tag}_seed${SEED}.log"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" "$PY" evaluation/predict_lesion_attributes.py \
