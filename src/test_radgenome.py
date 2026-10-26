@@ -143,6 +143,7 @@ def main():
         lesion_order=data_args.lesion_order,
         lesion_size_unit=data_args.lesion_size_unit,
         lesion_type=data_args.lesion_type,
+        lesion_type_min_conf=data_args.lesion_type_min_conf,
     )
 
     Test_dataloader = DataLoader(

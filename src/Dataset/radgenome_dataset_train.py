@@ -47,7 +47,7 @@ class RadGenomeDataset_Train(PersistentDataset):
     # runnable from one checkout -- and, more importantly, a seed sweep started
     # before the lesion work landed keeps producing baseline runs instead of
     # silently switching arms partway through.
-    def __init__(self, text_tokenizer, data_folder, mask_folder, csv_file, cache_dir, max_region_size=5, max_img_size = 1, image_num = 32, region_num=33, max_seq=2048, resize_dim=500, voc_size=32000, force_num_frames=True, nodule_metadata=None, lesion_pred_csv=None, lesion_order='truth', lesion_size_unit='mm', size_placeholder=False, lesion_type=False):
+    def __init__(self, text_tokenizer, data_folder, mask_folder, csv_file, cache_dir, max_region_size=5, max_img_size = 1, image_num = 32, region_num=33, max_seq=2048, resize_dim=500, voc_size=32000, force_num_frames=True, nodule_metadata=None, lesion_pred_csv=None, lesion_order='truth', lesion_size_unit='mm', size_placeholder=False, lesion_type=False, lesion_type_min_conf=0.0):
         # text_tokenizer
         self.text_tokenizer = AutoTokenizer.from_pretrained(
                 text_tokenizer,
@@ -98,14 +98,16 @@ class RadGenomeDataset_Train(PersistentDataset):
         self.max_region_size = max_region_size
         self.nodule_index = (
             load_nodule_index(nodule_metadata, MAX_LESION_PER_REGION,
-                              pred_csv=lesion_pred_csv, order=lesion_order, with_type=lesion_type)
+                              pred_csv=lesion_pred_csv, order=lesion_order, with_type=lesion_type,
+                              type_min_conf=lesion_type_min_conf)
             if nodule_metadata else None)
         if self.nodule_index is not None:
             print(f'[dataset] lesion tokens ON: {len(self.nodule_index)} '
                   f'(volume, region) pairs from {nodule_metadata}; '
                   f'order={lesion_order}, predicted sizes in prompt={bool(lesion_pred_csv)}'
                   + (f' ({lesion_size_unit})' if lesion_pred_csv else '')
-                  + (', predicted types in prompt' if lesion_type else ''))
+                  + (', predicted types in prompt' if lesion_type else '')
+                  + (f' (conf >= {lesion_type_min_conf})' if lesion_type and lesion_type_min_conf > 0 else ''))
         if lesion_size_unit not in ('mm', 'cm'):
             raise ValueError(f"lesion_size_unit must be 'mm' or 'cm', got {lesion_size_unit!r}")
         self.lesion_size_unit = lesion_size_unit

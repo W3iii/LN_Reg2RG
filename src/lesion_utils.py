@@ -28,7 +28,8 @@ LESION_CROP_SIZE = (64, 64, 32)
 BBOX_COLS = ['y0_crop', 'y1_crop', 'x0_crop', 'x1_crop', 'z0_crop', 'z1_crop']
 
 
-def load_nodule_index(csv_path, max_per_region=None, pred_csv=None, order='truth', with_type=False):
+def load_nodule_index(csv_path, max_per_region=None, pred_csv=None, order='truth', with_type=False,
+                      type_min_conf=0.0):
     """(Volumename, region) -> [(box, pred_mm, pred_type), ...], first = the one to lead with.
 
     order='truth'  rank by tw_lung_rads then eq_diam_mm, both descending (B2/B3a).
@@ -48,6 +49,12 @@ def load_nodule_index(csv_path, max_per_region=None, pred_csv=None, order='truth
     with_type=True (B3f) also reads pred_csv's pred_type column (GGO / solid /
     part-solid / calcified, cross-fitted like the sizes) and the prompt becomes
     "<lesionK> (~0.6cm, GGO)". Otherwise pred_type is None and nothing changes.
+
+    type_min_conf > 0 (B3g) keeps the type only where the encoder's confidence
+    (pred_type_conf, the max class probability) reaches it; other nodules get the
+    size alone, '<lesionK> (~0.6cm)'. In B3f (argmax, no threshold) only ~45% of
+    the train lobes whose prompt said GGO had a report that says GGO, so the LLM
+    learned to copy it ~30% of the time; at 0.8 that rises to ~61%.
 
     Overflow (>max_per_region in a lobe) keeps the first ones under the chosen
     order. Only 15 of 3144 (patient, lobe) pairs have more than 8, and the lobe's
@@ -80,7 +87,10 @@ def load_nodule_index(csv_path, max_per_region=None, pred_csv=None, order='truth
         if with_type and 'pred_type' not in p.columns:
             raise ValueError(f'{pred_csv} has no pred_type column: make it with '
                              f'predict_lesion_attributes.py --type_loss ce|ce_mil')
-        p = p[['Volumename', 'nodule_id', 'pred_diam_mm'] + (['pred_type'] if with_type else [])]
+        if with_type and type_min_conf > 0 and 'pred_type_conf' not in p.columns:
+            raise ValueError(f'{pred_csv} has no pred_type_conf column, needed for type_min_conf')
+        p = p[['Volumename', 'nodule_id', 'pred_diam_mm']
+              + (['pred_type', 'pred_type_conf'] if with_type else [])]
         if p.duplicated(['Volumename', 'nodule_id']).any():
             raise ValueError(f'{pred_csv}: duplicate (Volumename, nodule_id) rows')
         df = df.drop(columns=['pred_mm'] + (['pred_type'] if with_type else [])).merge(
@@ -92,6 +102,11 @@ def load_nodule_index(csv_path, max_per_region=None, pred_csv=None, order='truth
                              f'in {csv_path}; regenerate it from the same nodule_metadata.csv')
         if with_type and df['pred_type'].isna().any():
             raise ValueError(f'{pred_csv}: pred_type missing for {int(df.pred_type.isna().sum())} nodules')
+        if with_type and type_min_conf > 0:
+            low = df['pred_type_conf'] < type_min_conf
+            df['pred_type'] = df['pred_type'].astype(object).where(~low, None)
+            print(f'[lesion] type written for {int((~low).sum())}/{len(df)} nodules '
+                  f'(pred_type_conf >= {type_min_conf})')
 
     if order == 'truth':
         df = df.sort_values(['tw_lung_rads', 'eq_diam_mm'], ascending=False)

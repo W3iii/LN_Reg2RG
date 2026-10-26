@@ -54,6 +54,8 @@ lesion_order="${lesion_order:-truth}"
 lesion_size_unit="${lesion_size_unit:-mm}"
 size_placeholder="${size_placeholder:-False}"
 lesion_type="${lesion_type:-False}"
+# B3g: type only where the encoder is confident (pred_type_conf >= this); 0 = always (B3f).
+lesion_type_min_conf="${lesion_type_min_conf:-0.0}"
 
 # Results — tagged by split, checkpoint, and run_tag so runs do not overwrite (or
 # get silently skipped against) each other. test_radgenome.py appends and skips

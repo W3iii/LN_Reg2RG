@@ -38,6 +38,8 @@ class DataArguments:
     # B3f: also write the encoder's predicted nodule type into the prompt,
     # '<lesionK> (~0.6cm, GGO)'. Needs a lesion_pred_csv with a pred_type column.
     lesion_type: bool = field(default=False)
+    # B3g: write the type only when the encoder's confidence reaches this (0 = always, B3f)
+    lesion_type_min_conf: float = field(default=0.0)
     
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):

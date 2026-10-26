@@ -129,6 +129,7 @@ def main():
         lesion_size_unit=data_args.lesion_size_unit,
         size_placeholder=data_args.size_placeholder,
         lesion_type=data_args.lesion_type,
+        lesion_type_min_conf=data_args.lesion_type_min_conf,
     )
 
     print("Setup Model")
