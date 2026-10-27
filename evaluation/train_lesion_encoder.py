@@ -48,6 +48,13 @@ Batches are built from whole lobe bags so every MIL bag is complete in one batch
 
 --type_loss none | ce | ce_mil  selects the ablation arm (none = the B3e encoder).
 
+--concept adds a concept bottleneck for the grade: g(size, type) -> RADS, a small MLP
+that sees only the predicted size and type probabilities (see Net), trained with
+    + w_cbm * CE_w(g -> RADS) + w_consist * symmetric KL(direct grade, concept grade)
+The direct rads_head stays. Reported per epoch: the concept path's kappa / AUC, its
+agreement with the direct head, and how much higher g grades a solid than a GGO at the
+same predicted size (Lung-RADS says it should).
+
 Train on the train split, select on val, report val. Test is never touched.
 
 Crops are cached once (outputs/, git-ignored): reading 1258 NIfTI took ~11 min.
@@ -210,10 +217,22 @@ def train_loader(X, logd, rads, idx, bag, bs, workers, seed):
     return torch.utils.data.DataLoader(ds, batch_sampler=BagBatchSampler(bag[idx], bs, seed), num_workers=workers)
 
 
+G_LR_MULT = 10.0   # g is a 5 -> 32 -> 4 MLP on top of the heads: at the encoder's 3e-4 it is still
+                   # near chance after a few epochs, so it learns 10x faster
+
+
+def make_optim(model, lr):
+    g = list(model.g.parameters())
+    gid = {id(q) for q in g}
+    rest = [q for q in model.parameters() if id(q) not in gid]
+    return torch.optim.AdamW([{'params': rest, 'lr': lr}, {'params': g, 'lr': lr * G_LR_MULT}], weight_decay=1e-2)
+
+
 def one_cycle(opt, lr, epochs, dl):
     # +2 per epoch: a shuffled epoch can pack a batch more than len() counts, and
     # OneCycleLR raises if stepped past total_steps; the unused tail is ~0.1% of steps
-    return torch.optim.lr_scheduler.OneCycleLR(opt, lr, total_steps=epochs * (len(dl) + 2))
+    return torch.optim.lr_scheduler.OneCycleLR(opt, [grp['lr'] for grp in opt.param_groups],
+                                               total_steps=epochs * (len(dl) + 2))
 
 
 def eval_loader(X, logd, rads, idx, bs, workers=0):
@@ -222,23 +241,41 @@ def eval_loader(X, logd, rads, idx, bs, workers=0):
 
 
 # ------------------------------------------------------------------ models
+LOG_MM_CENTRE, LOG_MM_SCALE = 1.7, 0.5     # log(eq_diam_mm): median ~5.5 mm, most nodules 3-15 mm
+
+
 class Net(nn.Module):
+    """Encoder + three parallel heads on the 4096-d token, plus the concept path g.
+
+    g (--concept) grades a nodule from its *concepts* only -- the predicted size and
+    the predicted type probabilities -- the way TW Lung-RADS itself does (a 7 mm solid
+    nodule is category 3, a 7 mm GGO category 2). It never sees the token, so it is a
+    real bottleneck: change the size or the type and the grade follows. The direct
+    rads_head stays as the unconstrained reference.
+    """
+
     def __init__(self, arch):
         super().__init__()
         self.enc = LesionEncoder(dim=4096) if arch == 'gap' else PooledLesionEncoder(arch)
         self.size_head = nn.Sequential(nn.LayerNorm(4096), nn.Linear(4096, 1))
         self.rads_head = nn.Sequential(nn.LayerNorm(4096), nn.Linear(4096, 4))
         self.type_head = nn.Sequential(nn.LayerNorm(4096), nn.Linear(4096, N_TYPES))
+        self.g = nn.Sequential(nn.Linear(1 + N_TYPES, 32), nn.GELU(), nn.Linear(32, 4))
 
     def forward(self, x):
         t = self.enc(x)
         return self.size_head(t)[:, 0], self.rads_head(t), self.type_head(t), t
 
+    def concept(self, log_mm, type_probs):
+        """RADS logits from (log size, type probabilities) alone."""
+        z = ((log_mm.float() - LOG_MM_CENTRE) / LOG_MM_SCALE)[:, None]
+        return self.g(torch.cat([z, type_probs.float()], 1))
+
 
 def checkpoint(model, arch, metrics, **extra):
     return {'arch': arch, 'encoder': model.enc.state_dict(),
             'size_head': model.size_head.state_dict(), 'rads_head': model.rads_head.state_dict(),
-            'type_head': model.type_head.state_dict(), 'type_names': list(TYPES),
+            'type_head': model.type_head.state_dict(), 'g': model.g.state_dict(), 'type_names': list(TYPES),
             'metrics': {k: float(v) for k, v in metrics.items() if np.isscalar(v)}, **extra}
 
 
@@ -276,8 +313,10 @@ def mil_loss(type_logits, bag, ments, cw):
 class Objective:
     """The full Stage-1 loss; shared by this script and predict_lesion_attributes.py."""
 
-    def __init__(self, a, rads_train, tt, idx, device):
-        self.a, self.tt, self.device = a, tt, device
+    def __init__(self, a, rads_train, tt, idx, device, model=None):
+        self.a, self.tt, self.device, self.model = a, tt, device, model
+        if a.concept and model is None:
+            raise ValueError('--concept needs the model (for its g)')
         self.cw_rads = torch.tensor(len(idx) / (4 * np.bincount(rads_train, minlength=4).clip(1)), dtype=torch.float32, device=device)
         self.cw_type = torch.tensor(tt.class_weights(idx), device=device)
         self.tset = torch.tensor(tt.tset, device=device)
@@ -295,6 +334,16 @@ class Objective:
         if a.type_loss == 'ce_mil' and epoch >= a.mil_warmup:
             parts['mil'] = mil_loss(tl, self.bag[rows], self.tt.ments, self.cw_type)
             loss = loss + a.w_mil * parts['mil']
+        if a.concept:
+            # size is detached: it has its own full supervision, and the grade must not
+            # bend it. The type probabilities are not: RADS labels exist for every nodule,
+            # so this path also teaches the type head on the ones the reports never type.
+            rc = self.model.concept(s.detach(), F.softmax(tl.float(), 1))
+            parts['rads_cbm'] = F.cross_entropy(rc, r, weight=self.cw_rads)
+            lp, lq = F.log_softmax(rl.float(), 1), F.log_softmax(rc, 1)
+            parts['consist'] = 0.5 * (F.kl_div(lp, lq, log_target=True, reduction='batchmean')
+                                      + F.kl_div(lq, lp, log_target=True, reduction='batchmean'))
+            loss = loss + a.w_cbm * parts['rads_cbm'] + a.w_consist * parts['consist']
         return loss, {k: v.item() for k, v in parts.items()}
 
 
@@ -306,19 +355,25 @@ def add_loss_args(ap):
     ap.add_argument('--w_type', type=float, default=1.0)
     ap.add_argument('--w_mil', type=float, default=0.5)
     ap.add_argument('--mil_warmup', type=int, default=10, help='epochs before L_mil is switched on')
+    ap.add_argument('--concept', action='store_true',
+                    help='concept bottleneck: also grade RADS through g(size, type), see Net')
+    ap.add_argument('--w_cbm', type=float, default=1.0, help='weight of CE on the concept-path grade')
+    ap.add_argument('--w_consist', type=float, default=0.1, help='symmetric KL between direct and concept grades')
 
 
 # ------------------------------------------------------------------ eval
 @torch.no_grad()
-def evaluate(model, loader, device, tt=None):
+def evaluate(model, loader, device, tt=None, concept=False):
     model.eval()
-    P, L, T, Y, R, rows = [], [], [], [], [], []
+    P, L, T, C, Y, R, rows = [], [], [], [], [], [], []
     for x, logd, rads, row in loader:
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=device.type == 'cuda'):
             s, r, t, _ = model(x.to(device))
-        P.append(s.float().cpu()); L.append(F.softmax(r.float(), 1).cpu()); T.append(F.softmax(t.float(), 1).cpu())
+        tp = F.softmax(t.float(), 1)
+        P.append(s.float().cpu()); L.append(F.softmax(r.float(), 1).cpu()); T.append(tp.cpu())
+        C.append(F.softmax(model.concept(s, tp), 1).cpu())
         Y.append(logd); R.append(rads); rows.append(row)
-    P, L, T, Y, R, rows = (torch.cat(v).numpy() for v in (P, L, T, Y, R, rows))
+    P, L, T, C, Y, R, rows = (torch.cat(v).numpy() for v in (P, L, T, C, Y, R, rows))
     d, dhat = np.exp(Y), np.exp(P)
     big = d >= 6
     rads1 = R + 1
@@ -329,7 +384,35 @@ def evaluate(model, loader, device, tt=None):
              auc_ge3=roc_auc_score(rads1 >= 3, L[:, 2:].sum(1)), acc=float((pred == rads1).mean()))
     if tt is not None:
         m.update(type_metrics(T, rows, tt))
+    if concept:
+        pc = C.argmax(1) + 1
+        m.update(kappa_cbm=cohen_kappa_score(rads1, pc, weights='quadratic'),
+                 auc_ge3_cbm=roc_auc_score(rads1 >= 3, C[:, 2:].sum(1)), acc_cbm=float((pc == rads1).mean()),
+                 agree_cbm=float((pc == pred).mean()))
+        m.update(concept_type_effect(model, P, device))
     return m
+
+
+@torch.no_grad()
+def concept_type_effect(model, log_mm, device):
+    """Does g use the type? Grade every nodule at its own predicted size twice, as a pure
+    solid and as a pure GGO, and compare the expected category (1-4). Lung-RADS says solid
+    should grade higher at the same size; ~0 means g is reading the size alone."""
+    s = torch.as_tensor(log_mm, device=device)
+    out = {}
+    exp = {}
+    for name in ('solid', 'GGO'):
+        oh = torch.zeros(len(s), N_TYPES, device=device)
+        oh[:, TYPES.index(name)] = 1
+        p = F.softmax(model.concept(s, oh), 1)
+        exp[name] = (p * torch.arange(1, 5, device=device)).sum(1).cpu().numpy()
+    d = exp['solid'] - exp['GGO']
+    mm = np.exp(log_mm)
+    out['cbm_solid_minus_ggo'] = float(d.mean())
+    band = (mm >= 6) & (mm < 8)
+    if band.any():
+        out['cbm_solid_minus_ggo_6to8mm'] = float(d[band].mean())
+    return out
 
 
 def type_metrics(T, rows, tt):
@@ -358,6 +441,13 @@ def type_metrics(T, rows, tt):
     if hits:
         m['bag_hit'] = float(np.mean(hits)); m['bag_n'] = len(hits)
     return m
+
+
+def fmt_cbm(m):
+    if 'kappa_cbm' not in m:
+        return ''
+    return (f' | concept kappa {m["kappa_cbm"]:.3f} AUC>=3 {m["auc_ge3_cbm"]:.3f} agree {m["agree_cbm"]:.2f} '
+            f'solid-GGO {m["cbm_solid_minus_ggo"]:+.2f} (6-8mm {m.get("cbm_solid_minus_ggo_6to8mm", float("nan")):+.2f})')
 
 
 def fmt_type(m):
@@ -405,12 +495,12 @@ def main():
     dl_va = eval_loader(X, logd, rads, va, a.bs, a.workers)
 
     model = Net(a.arch).to(device)
-    obj = Objective(a, rads[tr], tt, tr, device)
-    opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-2)
+    obj = Objective(a, rads[tr], tt, tr, device, model)
+    opt = make_optim(model, a.lr)
     sched = one_cycle(opt, a.lr, a.epochs, dl_tr)
     # type_loss is always in the name, so the 'none' arm never overwrites the B3a encoder
     # (outputs/lesion_enc_<arch>_seed<seed>/best.pt, trained before the type head existed)
-    out = a.out or os.path.join(HERE, '..', 'outputs', f'lesion_enc_{a.arch}_{a.type_loss}_seed{a.seed}')
+    out = a.out or os.path.join(HERE, '..', 'outputs', f'lesion_enc_{a.arch}_{a.type_loss}{"_cbm" if a.concept else ""}_seed{a.seed}')
     os.makedirs(out, exist_ok=True)
 
     best, best_score, hist = None, -1e9, []
@@ -425,7 +515,7 @@ def main():
             tot += loss.item(); nb += 1
             for k, v in p.items():
                 parts[k] = parts.get(k, 0.0) + v
-        m = evaluate(model, dl_va, device, tt)
+        m = evaluate(model, dl_va, device, tt, a.concept)
         m.update(epoch=ep + 1, train_loss=tot / nb, **{f'loss_{k}': v / nb for k, v in parts.items()})
         hist.append(m)
         # model selection on val; the type term only once type is being trained
@@ -433,15 +523,18 @@ def main():
         flag = ''
         if score > best_score:
             best_score, best = score, m
-            torch.save(checkpoint(model, a.arch, m, type_loss=a.type_loss), os.path.join(out, 'best.pt'))
+            torch.save(checkpoint(model, a.arch, m, type_loss=a.type_loss, concept=a.concept), os.path.join(out, 'best.pt'))
             flag = ' *'
         lp = ' '.join(f'{k} {v / nb:.3f}' for k, v in parts.items())
         print(f'ep {ep+1:3d} loss {m["train_loss"]:.3f} ({lp}) | val rho {m["rho"]:.3f} MAE(>=6) {m["MAE_ge6"]:.2f} '
-              f'kappa {m["kappa"]:.3f} AUC>=3 {m["auc_ge3"]:.3f}{fmt_type(m)} | {time.time()-t0:.0f}s{flag}', flush=True)
+              f'kappa {m["kappa"]:.3f} AUC>=3 {m["auc_ge3"]:.3f}{fmt_type(m)}{fmt_cbm(m)} | {time.time()-t0:.0f}s{flag}', flush=True)
 
     json.dump({'best': best, 'history': hist, 'args': vars(a)}, open(os.path.join(out, 'metrics.json'), 'w'), indent=1, default=float)
-    print(f'\nBEST arch={a.arch} type_loss={a.type_loss}: rho {best["rho"]:.3f}  MAE {best["MAE"]:.2f}  MAE(>=6) {best["MAE_ge6"]:.2f}  '
-          f'kappa {best["kappa"]:.3f}  AUC>=3 {best["auc_ge3"]:.3f}{fmt_type(best)}  (epoch {best["epoch"]})')
+    print(f'\nBEST arch={a.arch} type_loss={a.type_loss}{" +concept" if a.concept else ""}: rho {best["rho"]:.3f}  MAE {best["MAE"]:.2f}  MAE(>=6) {best["MAE_ge6"]:.2f}  '
+          f'kappa {best["kappa"]:.3f}  AUC>=3 {best["auc_ge3"]:.3f}{fmt_type(best)}{fmt_cbm(best)}  (epoch {best["epoch"]})')
+    last = hist[-1]
+    print(f'LAST  epoch {last["epoch"]} (no val selection): rho {last["rho"]:.3f}  kappa {last["kappa"]:.3f}  '
+          f'AUC>=3 {last["auc_ge3"]:.3f}{fmt_type(last)}{fmt_cbm(last)}')
     print('reference (val): attn size+RADS only rho 0.805 / kappa 0.694; report-text GGO recall of B3e_clean 0.18')
 
 

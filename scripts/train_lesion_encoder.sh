@@ -7,6 +7,8 @@
 #        logs outputs/seed_sweep_logs/lesion_enc_attn_{none,ce,ce_mil}_seed0.log
 #   ARCHS="gap center attn" TYPE_LOSSES=none bash scripts/train_lesion_encoder.sh   # the pooling comparison
 #   TYPE_LOSSES=ce_mil W_MIL=1.0 bash scripts/train_lesion_encoder.sh
+#   TYPE_LOSSES=ce_mil CONCEPT=1 bash scripts/train_lesion_encoder.sh   # + concept bottleneck g(size, type) -> RADS
+#     -> outputs/lesion_enc_attn_ce_mil_cbm_seed0/, log ..._ce_mil_cbm_seed0.log
 set -eu
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 export PYTHONWARNINGS=ignore
@@ -20,17 +22,21 @@ SEED="${SEED:-0}"
 W_TYPE="${W_TYPE:-1.0}"
 W_MIL="${W_MIL:-0.5}"
 MIL_WARMUP="${MIL_WARMUP:-10}"
+CONCEPT="${CONCEPT:-0}"
+W_CBM="${W_CBM:-1.0}"
+W_CONSIST="${W_CONSIST:-0.1}"
+if [ "$CONCEPT" = 1 ]; then CBM_ARGS="--concept --w_cbm $W_CBM --w_consist $W_CONSIST"; CBM_SFX=_cbm; else CBM_ARGS=""; CBM_SFX=""; fi
 mkdir -p outputs/seed_sweep_logs
 for arch in $ARCHS; do
   for tl in $TYPE_LOSSES; do
-    log="outputs/seed_sweep_logs/lesion_enc_${arch}_${tl}_seed${SEED}.log"
+    log="outputs/seed_sweep_logs/lesion_enc_${arch}_${tl}${CBM_SFX}_seed${SEED}.log"
     LOGS="${LOGS:-} $log"
-    echo "=== $arch type_loss=$tl -> $log"
+    echo "=== $arch type_loss=$tl concept=$CONCEPT -> $log"
     CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" "$PY" evaluation/train_lesion_encoder.py \
         --arch "$arch" --type_loss "$tl" --data_root "$DATA_ROOT" --epochs "$EPOCHS" --seed "$SEED" \
-        --w_type "$W_TYPE" --w_mil "$W_MIL" --mil_warmup "$MIL_WARMUP" 2>&1 | tee "$log"
+        --w_type "$W_TYPE" --w_mil "$W_MIL" --mil_warmup "$MIL_WARMUP" $CBM_ARGS 2>&1 | tee "$log"
   done
 done
 echo
 echo "=== summary"
-grep -h "^BEST" $LOGS
+grep -h "^BEST\|^LAST" $LOGS

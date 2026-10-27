@@ -44,15 +44,15 @@ from sklearn.model_selection import GroupKFold
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from train_lesion_encoder import (Net, Objective, TypeTargets, TYPES, add_loss_args, build_cache,   # noqa: E402
-                                  checkpoint, eval_loader, evaluate, fmt_type, one_cycle, train_loader)
+                                  checkpoint, eval_loader, evaluate, fmt_cbm, fmt_type, make_optim, one_cycle, train_loader)
 
 
 def fit(a, X, logd, rads, tt, idx, device, tag):
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     dl = train_loader(X, logd, rads, idx, tt.bag, a.bs, a.workers, a.seed)
     model = Net(a.arch).to(device)
-    obj = Objective(a, rads[idx], tt, idx, device)
-    opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-2)
+    obj = Objective(a, rads[idx], tt, idx, device, model)
+    opt = make_optim(model, a.lr)
     sched = one_cycle(opt, a.lr, a.epochs, dl)
     t0 = time.time()
     for ep in range(a.epochs):
@@ -70,13 +70,15 @@ def fit(a, X, logd, rads, tt, idx, device, tag):
 @torch.no_grad()
 def predict(model, X, idx, device, bs=128):
     model.eval()
-    S, P, T = [], [], []
+    S, P, T, C = [], [], [], []
     for s in range(0, len(idx), bs):
         x = torch.from_numpy(np.asarray(X[idx[s:s + bs]]).astype(np.float32))[:, None].to(device)
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=device.type == 'cuda'):
             sz, logits, tlog, _ = model(x)
-        S.append(sz.float().cpu()); P.append(F.softmax(logits.float(), 1).cpu()); T.append(F.softmax(tlog.float(), 1).cpu())
-    return np.exp(torch.cat(S).numpy()), torch.cat(P).numpy(), torch.cat(T).numpy()
+        tp = F.softmax(tlog.float(), 1)
+        S.append(sz.float().cpu()); P.append(F.softmax(logits.float(), 1).cpu()); T.append(tp.cpu())
+        C.append(F.softmax(model.concept(sz, tp), 1).cpu())
+    return np.exp(torch.cat(S).numpy()), torch.cat(P).numpy(), torch.cat(T).numpy(), torch.cat(C).numpy()
 
 
 def main():
@@ -113,30 +115,32 @@ def main():
 
     # type_loss always in the name: '--type_loss none' must not overwrite B3e's
     # outputs/lesion_pred_<arch>_seed<seed>.csv, which B3e/B3e_clean inference still reads
-    tag = f'{a.arch}_{a.type_loss}'
+    tag = f'{a.arch}_{a.type_loss}' + ('_cbm' if a.concept else '')
     out = a.out or os.path.join(HERE, '..', 'outputs', f'lesion_pred_{tag}_seed{a.seed}.csv')
     pred_d = np.full(len(meta), np.nan)
     pred_p = np.full((len(meta), 4), np.nan)
     pred_t = np.full((len(meta), len(TYPES)), np.nan)
+    pred_c = np.full((len(meta), 4), np.nan)
     source = np.array([''] * len(meta), dtype=object)
 
     # out-of-fold on train patients (a MIL bag is one lobe of one patient, so it never straddles folds)
     oof_metrics = []
     for k, (fit_i, ho_i) in enumerate(GroupKFold(n_splits=a.folds).split(tr, groups=pid[tr])):
         m = fit(a, X, logd, rads, tt, tr[fit_i], device, f'fold {k+1}/{a.folds}')
-        d, p, t = predict(m, X, tr[ho_i], device)
-        pred_d[tr[ho_i]], pred_p[tr[ho_i]], pred_t[tr[ho_i]], source[tr[ho_i]] = d, p, t, f'oof{k+1}'
-        oof_metrics.append(evaluate(m, eval_loader(X, logd, rads, tr[ho_i], a.bs), device, tt))
+        d, p, t, c = predict(m, X, tr[ho_i], device)
+        pred_d[tr[ho_i]], pred_p[tr[ho_i]], pred_t[tr[ho_i]], pred_c[tr[ho_i]], source[tr[ho_i]] = d, p, t, c, f'oof{k+1}'
+        oof_metrics.append(evaluate(m, eval_loader(X, logd, rads, tr[ho_i], a.bs), device, tt, a.concept))
         del m; torch.cuda.empty_cache()
 
     # all of train -> val, test
     m = fit(a, X, logd, rads, tt, tr, device, 'full')
     for idx in (va, te):
         if len(idx):
-            d, p, t = predict(m, X, idx, device)
-            pred_d[idx], pred_p[idx], pred_t[idx], source[idx] = d, p, t, 'full'
-    vm = evaluate(m, eval_loader(X, logd, rads, va, a.bs), device, tt)
-    torch.save(checkpoint(m, a.arch, vm, type_loss=a.type_loss, note='fitted on all train, last epoch, no val selection'),
+            d, p, t, c = predict(m, X, idx, device)
+            pred_d[idx], pred_p[idx], pred_t[idx], pred_c[idx], source[idx] = d, p, t, c, 'full'
+    vm = evaluate(m, eval_loader(X, logd, rads, va, a.bs), device, tt, a.concept)
+    torch.save(checkpoint(m, a.arch, vm, type_loss=a.type_loss, concept=a.concept,
+                          note='fitted on all train, last epoch, no val selection'),
                out.replace('.csv', '_full.pt'))
 
     res = meta.copy()
@@ -151,12 +155,17 @@ def main():
             res[f'p_{n.replace("-", "_")}'] = pred_t[:, c].round(4)
         # report-derived label, for scoring only (empty for test: never parsed)
         res['type_label'] = [TYPES[h] if h >= 0 else '' for h in tt.hard]
+    if a.concept:
+        # the concept-path grade: from predicted size + type alone (train_lesion_encoder.Net)
+        res['pred_rads_cbm'] = np.nanargmax(pred_c, 1) + 1
+        for c in range(4):
+            res[f'p_rads_cbm{c+1}'] = pred_c[:, c].round(4)
     res['pred_source'] = source
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     res.to_csv(out, index=False)
 
     f = lambda m: (f'rho {m["rho"]:.3f}  MAE {m["MAE"]:.2f}  MAE(>=6) {m["MAE_ge6"]:.2f}  kappa {m["kappa"]:.3f}  '
-                   f'AUC>=3 {m["auc_ge3"]:.3f}' + (fmt_type(m) if a.type_loss != 'none' else ''))
+                   f'AUC>=3 {m["auc_ge3"]:.3f}' + (fmt_type(m) if a.type_loss != 'none' else '') + fmt_cbm(m))
     print()
     for k, mm in enumerate(oof_metrics):
         print(f'OOF fold {k+1}: {f(mm)}')
