@@ -9,6 +9,8 @@
 #   TYPE_LOSSES=ce_mil W_MIL=1.0 bash scripts/train_lesion_encoder.sh
 #   TYPE_LOSSES=ce_mil CONCEPT=1 bash scripts/train_lesion_encoder.sh   # + concept bottleneck g(size, type) -> RADS
 #     -> outputs/lesion_enc_attn_ce_mil_cbm_seed0/, log ..._ce_mil_cbm_seed0.log
+#   TYPE_LOSSES=ce_mil CONCEPT=frozen bash scripts/train_lesion_encoder.sh   # arm C: g pretrained + frozen, grade loss -> type head
+#     -> outputs/lesion_enc_attn_ce_mil_cbmfrozen_seed0/
 set -eu
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 export PYTHONWARNINGS=ignore
@@ -25,7 +27,11 @@ MIL_WARMUP="${MIL_WARMUP:-10}"
 CONCEPT="${CONCEPT:-0}"
 W_CBM="${W_CBM:-1.0}"
 W_CONSIST="${W_CONSIST:-0.1}"
-if [ "$CONCEPT" = 1 ]; then CBM_ARGS="--concept --w_cbm $W_CBM --w_consist $W_CONSIST"; CBM_SFX=_cbm; else CBM_ARGS=""; CBM_SFX=""; fi
+case "$CONCEPT" in
+  1|joint) CBM_ARGS="--concept joint --w_cbm $W_CBM --w_consist $W_CONSIST"; CBM_SFX=_cbm ;;
+  frozen)  CBM_ARGS="--concept frozen --w_cbm ${W_CBM_FROZEN:-0.3}"; CBM_SFX=_cbmfrozen ;;
+  *)       CBM_ARGS=""; CBM_SFX="" ;;
+esac
 mkdir -p outputs/seed_sweep_logs
 for arch in $ARCHS; do
   for tl in $TYPE_LOSSES; do

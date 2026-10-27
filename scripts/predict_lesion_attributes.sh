@@ -17,7 +17,11 @@ W_TYPE="${W_TYPE:-1.0}"
 W_MIL="${W_MIL:-0.5}"
 MIL_WARMUP="${MIL_WARMUP:-10}"
 CONCEPT="${CONCEPT:-0}"
-if [ "$CONCEPT" = 1 ]; then CBM_ARGS="--concept"; CBM_SFX=_cbm; else CBM_ARGS=""; CBM_SFX=""; fi
+case "$CONCEPT" in
+  1|joint) CBM_ARGS="--concept joint"; CBM_SFX=_cbm ;;
+  frozen)  CBM_ARGS="--concept frozen --w_cbm ${W_CBM_FROZEN:-0.3}"; CBM_SFX=_cbmfrozen ;;
+  *)       CBM_ARGS=""; CBM_SFX="" ;;
+esac
 tag="${ARCH}_${TYPE_LOSS}${CBM_SFX}"
 mkdir -p outputs/seed_sweep_logs
 log="outputs/seed_sweep_logs/lesion_pred_${tag}_seed${SEED}.log"

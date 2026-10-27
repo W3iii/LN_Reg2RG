@@ -55,6 +55,14 @@ The direct rads_head stays. Reported per epoch: the concept path's kappa / AUC, 
 agreement with the direct head, and how much higher g grades a solid than a GGO at the
 same predicted size (Lung-RADS says it should).
 
+--concept frozen (arm C) keeps g fixed instead: before the encoder trains, g is fitted on
+the training nodules that have a hard type label -- TRUE size + one-hot type -> RADS --
+and then frozen. While the encoder trains, the grade loss still flows through the frozen
+g back into the type head, but only for nodules whose own text gives no type, and only
+after --mil_warmup. A fixed g is a fixed rule: the type head can only move toward a type
+that explains the grade under that rule, not redefine "solid" as "graded high", which is
+what the jointly trained g did (OOF type bacc -0.046).
+
 Train on the train split, select on val, report val. Test is never touched.
 
 Crops are cached once (outputs/, git-ignored): reading 1258 NIfTI took ~11 min.
@@ -315,7 +323,7 @@ class Objective:
 
     def __init__(self, a, rads_train, tt, idx, device, model=None):
         self.a, self.tt, self.device, self.model = a, tt, device, model
-        if a.concept and model is None:
+        if a.concept != 'none' and model is None:
             raise ValueError('--concept needs the model (for its g)')
         self.cw_rads = torch.tensor(len(idx) / (4 * np.bincount(rads_train, minlength=4).clip(1)), dtype=torch.float32, device=device)
         self.cw_type = torch.tensor(tt.class_weights(idx), device=device)
@@ -334,7 +342,16 @@ class Objective:
         if a.type_loss == 'ce_mil' and epoch >= a.mil_warmup:
             parts['mil'] = mil_loss(tl, self.bag[rows], self.tt.ments, self.cw_type)
             loss = loss + a.w_mil * parts['mil']
-        if a.concept:
+        if a.concept == 'frozen' and epoch >= a.mil_warmup:
+            # arm C: the grade loss reaches the type head through the FROZEN g, only for
+            # nodules whose own text names no type (labelled ones keep their own CE)
+            free = self.tset[rows].sum(1) == 0
+            if free.any():
+                rc = self.model.concept(s.detach()[free], F.softmax(tl.float()[free], 1))
+                w = self.cw_rads[r[free]]
+                parts['rads_cbm'] = (w * F.cross_entropy(rc, r[free], reduction='none')).sum() / w.sum()
+                loss = loss + a.w_cbm * parts['rads_cbm']
+        if a.concept == 'joint':
             # size is detached: it has its own full supervision, and the grade must not
             # bend it. The type probabilities are not: RADS labels exist for every nodule,
             # so this path also teaches the type head on the ones the reports never type.
@@ -347,6 +364,40 @@ class Objective:
         return loss, {k: v.item() for k, v in parts.items()}
 
 
+def concept_suffix(a):
+    return {'none': '', 'joint': '_cbm', 'frozen': '_cbmfrozen'}[a.concept]
+
+
+@torch.enable_grad()
+def pretrain_g(model, logd, rads, tt, idx, device, steps=4000, seed=0):
+    """Arm C: fit g on (true log size, one-hot hard type) -> RADS over the hard-labelled
+    nodules in idx (training nodules only), then freeze it."""
+    lab = idx[tt.hard[idx] >= 0]
+    x = torch.as_tensor(logd[lab], device=device)
+    oh = F.one_hot(torch.as_tensor(tt.hard[lab], device=device), N_TYPES).float()
+    y = torch.as_tensor(rads[lab], device=device)
+    cw = torch.tensor(len(lab) / (4 * np.bincount(rads[lab], minlength=4).clip(1)), dtype=torch.float32, device=device)
+    for q in model.g.parameters():
+        q.requires_grad_(True)
+    opt = torch.optim.AdamW(model.g.parameters(), lr=3e-3, weight_decay=1e-2)
+    gen = torch.Generator(device='cpu').manual_seed(seed)
+    for _ in range(steps):
+        i = torch.randint(0, len(lab), (64,), generator=gen).to(device)
+        loss = F.cross_entropy(model.concept(x[i], oh[i]), y[i], weight=cw)
+        opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
+    for q in model.g.parameters():
+        q.requires_grad_(False)
+    with torch.no_grad():
+        pred = model.concept(x, oh).argmax(1).cpu().numpy() + 1
+        e = {}
+        for name in ('solid', 'GGO'):
+            o = torch.zeros(1, N_TYPES, device=device); o[0, TYPES.index(name)] = 1
+            pr = F.softmax(model.concept(torch.tensor([float(np.log(7.0))], device=device), o), 1)
+            e[name] = float((pr * torch.arange(1, 5, device=device)).sum())
+    print(f'[g] pretrained on {len(lab)} hard-labelled nodules, frozen: train kappa '
+          f'{cohen_kappa_score(rads[lab] + 1, pred, weights="quadratic"):.3f}; at 7 mm solid {e["solid"]:.2f} vs GGO {e["GGO"]:.2f}', flush=True)
+
+
 def add_loss_args(ap):
     ap.add_argument('--type_loss', choices=['none', 'ce', 'ce_mil'], default='ce_mil',
                     help='none = size + RADS only (the B3e encoder); ce = + nodule-level type; ce_mil = + lobe-level MIL')
@@ -355,8 +406,9 @@ def add_loss_args(ap):
     ap.add_argument('--w_type', type=float, default=1.0)
     ap.add_argument('--w_mil', type=float, default=0.5)
     ap.add_argument('--mil_warmup', type=int, default=10, help='epochs before L_mil is switched on')
-    ap.add_argument('--concept', action='store_true',
-                    help='concept bottleneck: also grade RADS through g(size, type), see Net')
+    ap.add_argument('--concept', nargs='?', const='joint', default='none', choices=['none', 'joint', 'frozen'],
+                    help='concept bottleneck g(size, type) -> RADS, see Net. joint = g trained with the encoder '
+                         '(bare --concept); frozen = arm C, g pretrained on labelled nodules then fixed')
     ap.add_argument('--w_cbm', type=float, default=1.0, help='weight of CE on the concept-path grade')
     ap.add_argument('--w_consist', type=float, default=0.1, help='symmetric KL between direct and concept grades')
 
@@ -384,7 +436,7 @@ def evaluate(model, loader, device, tt=None, concept=False):
              auc_ge3=roc_auc_score(rads1 >= 3, L[:, 2:].sum(1)), acc=float((pred == rads1).mean()))
     if tt is not None:
         m.update(type_metrics(T, rows, tt))
-    if concept:
+    if concept and concept != 'none':
         pc = C.argmax(1) + 1
         m.update(kappa_cbm=cohen_kappa_score(rads1, pc, weights='quadratic'),
                  auc_ge3_cbm=roc_auc_score(rads1 >= 3, C[:, 2:].sum(1)), acc_cbm=float((pc == rads1).mean()),
@@ -495,12 +547,14 @@ def main():
     dl_va = eval_loader(X, logd, rads, va, a.bs, a.workers)
 
     model = Net(a.arch).to(device)
+    if a.concept == 'frozen':
+        pretrain_g(model, logd, rads, tt, tr, device, seed=a.seed)
     obj = Objective(a, rads[tr], tt, tr, device, model)
     opt = make_optim(model, a.lr)
     sched = one_cycle(opt, a.lr, a.epochs, dl_tr)
     # type_loss is always in the name, so the 'none' arm never overwrites the B3a encoder
     # (outputs/lesion_enc_<arch>_seed<seed>/best.pt, trained before the type head existed)
-    out = a.out or os.path.join(HERE, '..', 'outputs', f'lesion_enc_{a.arch}_{a.type_loss}{"_cbm" if a.concept else ""}_seed{a.seed}')
+    out = a.out or os.path.join(HERE, '..', 'outputs', f'lesion_enc_{a.arch}_{a.type_loss}{concept_suffix(a)}_seed{a.seed}')
     os.makedirs(out, exist_ok=True)
 
     best, best_score, hist = None, -1e9, []
@@ -530,7 +584,7 @@ def main():
               f'kappa {m["kappa"]:.3f} AUC>=3 {m["auc_ge3"]:.3f}{fmt_type(m)}{fmt_cbm(m)} | {time.time()-t0:.0f}s{flag}', flush=True)
 
     json.dump({'best': best, 'history': hist, 'args': vars(a)}, open(os.path.join(out, 'metrics.json'), 'w'), indent=1, default=float)
-    print(f'\nBEST arch={a.arch} type_loss={a.type_loss}{" +concept" if a.concept else ""}: rho {best["rho"]:.3f}  MAE {best["MAE"]:.2f}  MAE(>=6) {best["MAE_ge6"]:.2f}  '
+    print(f'\nBEST arch={a.arch} type_loss={a.type_loss}{"" if a.concept == "none" else " +concept=" + a.concept}: rho {best["rho"]:.3f}  MAE {best["MAE"]:.2f}  MAE(>=6) {best["MAE_ge6"]:.2f}  '
           f'kappa {best["kappa"]:.3f}  AUC>=3 {best["auc_ge3"]:.3f}{fmt_type(best)}{fmt_cbm(best)}  (epoch {best["epoch"]})')
     last = hist[-1]
     print(f'LAST  epoch {last["epoch"]} (no val selection): rho {last["rho"]:.3f}  kappa {last["kappa"]:.3f}  '

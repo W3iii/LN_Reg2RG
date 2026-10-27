@@ -44,13 +44,16 @@ from sklearn.model_selection import GroupKFold
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from train_lesion_encoder import (Net, Objective, TypeTargets, TYPES, add_loss_args, build_cache,   # noqa: E402
-                                  checkpoint, eval_loader, evaluate, fmt_cbm, fmt_type, make_optim, one_cycle, train_loader)
+                                  checkpoint, concept_suffix, eval_loader, evaluate, fmt_cbm, fmt_type, make_optim, one_cycle,
+                                  pretrain_g, train_loader)
 
 
 def fit(a, X, logd, rads, tt, idx, device, tag):
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     dl = train_loader(X, logd, rads, idx, tt.bag, a.bs, a.workers, a.seed)
     model = Net(a.arch).to(device)
+    if a.concept == 'frozen':
+        pretrain_g(model, logd, rads, tt, idx, device, seed=a.seed)   # this fold's training nodules only
     obj = Objective(a, rads[idx], tt, idx, device, model)
     opt = make_optim(model, a.lr)
     sched = one_cycle(opt, a.lr, a.epochs, dl)
@@ -115,7 +118,7 @@ def main():
 
     # type_loss always in the name: '--type_loss none' must not overwrite B3e's
     # outputs/lesion_pred_<arch>_seed<seed>.csv, which B3e/B3e_clean inference still reads
-    tag = f'{a.arch}_{a.type_loss}' + ('_cbm' if a.concept else '')
+    tag = f'{a.arch}_{a.type_loss}' + concept_suffix(a)
     out = a.out or os.path.join(HERE, '..', 'outputs', f'lesion_pred_{tag}_seed{a.seed}.csv')
     pred_d = np.full(len(meta), np.nan)
     pred_p = np.full((len(meta), 4), np.nan)
@@ -155,7 +158,7 @@ def main():
             res[f'p_{n.replace("-", "_")}'] = pred_t[:, c].round(4)
         # report-derived label, for scoring only (empty for test: never parsed)
         res['type_label'] = [TYPES[h] if h >= 0 else '' for h in tt.hard]
-    if a.concept:
+    if a.concept != 'none':
         # the concept-path grade: from predicted size + type alone (train_lesion_encoder.Net)
         res['pred_rads_cbm'] = np.nanargmax(pred_c, 1) + 1
         for c in range(4):
