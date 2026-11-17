@@ -181,3 +181,24 @@ def normalize_lesion(crop, hu_min=-1000.0, hu_max=200.0):
     """Same HU window and scaling the region pathway applies to lobe volumes."""
     crop = np.clip(crop, hu_min, hu_max)
     return ((crop + 400.0) / 600.0).astype(np.float32)
+
+
+def load_nodule_boxes(csv_path):
+    """(Volumename, nodule_id) -> (box, eq_diam_mm) from nodule_metadata_v2.csv.
+
+    The v2 report CSVs (region_report_v2_*.csv) name each lobe's nodules by id, in the
+    order the lobe's [SIZE#<id>] placeholders and lesion slots use (mask size, largest
+    first), so the v2 datasets look boxes up by id instead of ranking them here.
+    Covers ME and LDCT; LDCT has no TW_Lung_RADS, which nothing here needs.
+    """
+    df = pd.read_csv(csv_path)
+    missing = [c for c in BBOX_COLS + ['Volumename', 'nodule_id', 'eq_diam_mm'] if c not in df.columns]
+    if missing:
+        raise ValueError(f'{csv_path} is missing {missing}')
+    df = df.dropna(subset=BBOX_COLS)
+    if df.duplicated(['Volumename', 'nodule_id']).any():
+        raise ValueError(f'{csv_path}: duplicate (Volumename, nodule_id)')
+    return {(str(r.Volumename), int(r.nodule_id)):
+            ((int(r.y0_crop), int(r.y1_crop), int(r.x0_crop), int(r.x1_crop), int(r.z0_crop), int(r.z1_crop)),
+             float(r.eq_diam_mm))
+            for r in df.itertuples()}

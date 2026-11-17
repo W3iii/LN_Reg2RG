@@ -38,8 +38,9 @@ CONDITIONS = [
 ]
 
 from regions import REGIONS, MAX_LESION_PER_REGION, lesion_token_names
-from lesion_utils import load_nodule_index, crop_lesion, normalize_lesion, lesion_token_text
+from lesion_utils import load_nodule_index, load_nodule_boxes, crop_lesion, normalize_lesion, lesion_token_text
 from size_placeholder import mask_sizes
+from Dataset.report_v2 import is_v2_csv, load_v2_reports, lobe_nodules, build_v2_text, token_mask_for_spans
 
 class RadGenomeDataset_Train(PersistentDataset):
     # NOTE: nodule_metadata defaults to None, i.e. lesion tokens OFF. The B0
@@ -47,7 +48,7 @@ class RadGenomeDataset_Train(PersistentDataset):
     # runnable from one checkout -- and, more importantly, a seed sweep started
     # before the lesion work landed keeps producing baseline runs instead of
     # silently switching arms partway through.
-    def __init__(self, text_tokenizer, data_folder, mask_folder, csv_file, cache_dir, max_region_size=5, max_img_size = 1, image_num = 32, region_num=33, max_seq=2048, resize_dim=500, voc_size=32000, force_num_frames=True, nodule_metadata=None, lesion_pred_csv=None, lesion_order='truth', lesion_size_unit='mm', size_placeholder=False, lesion_type=False, lesion_type_min_conf=0.0):
+    def __init__(self, text_tokenizer, data_folder, mask_folder, csv_file, cache_dir, max_region_size=5, max_img_size = 1, image_num = 32, region_num=33, max_seq=2048, resize_dim=500, voc_size=32000, force_num_frames=True, nodule_metadata=None, lesion_pred_csv=None, lesion_order='truth', lesion_size_unit='mm', size_placeholder=False, lesion_type=False, lesion_type_min_conf=0.0, lesion_tokens_per_nodule=1):
         # text_tokenizer
         self.text_tokenizer = AutoTokenizer.from_pretrained(
                 text_tokenizer,
@@ -82,8 +83,11 @@ class RadGenomeDataset_Train(PersistentDataset):
         # and this list must match Reg2RG.py and radgenome_dataset_test.py exactly
         # (rule 1 there) -- a mismatch doesn't raise, it just selects the wrong
         # embedding row.
+        # lesion_tokens_per_nodule must be regions.tokens_per_lesion(lesion_arch) -- the
+        # model sizes its lesion-embedding grid from the encoder it builds.
+        self.n_tok = lesion_tokens_per_nodule
         special_token["additional_special_tokens"].extend(
-            lesion_token_names(max_region_size))
+            lesion_token_names(max_region_size, self.n_tok))
 
         self.text_tokenizer.add_special_tokens(
             special_token
@@ -96,6 +100,21 @@ class RadGenomeDataset_Train(PersistentDataset):
         self.text_tokenizer.eos_token_id = 2
 
         self.max_region_size = max_region_size
+        # GT v2 / split C (Dataset/report_v2.py): detected from the CSV's columns. Lesions
+        # come from the CSV's per-lobe nodule_ids (mask-size order), boxes by id from
+        # nodule_metadata_v2.csv; the B3c-B3g prompt extras do not apply.
+        self.v2 = is_v2_csv(csv_file)
+        self.nodule_boxes = None
+        if self.v2:
+            if lesion_pred_csv or lesion_type or size_placeholder:
+                raise ValueError('v2 report CSV: lesion_pred_csv / lesion_type / size_placeholder are v1 options '
+                                 '(sizes are already [SIZE#k] placeholders, filled from the masks)')
+            self.reports_v2 = load_v2_reports(csv_file)
+            self.nodule_boxes = load_nodule_boxes(nodule_metadata) if nodule_metadata else None
+            nodule_metadata = None          # the v1 ranking index stays off
+            print(f'[dataset] v2 reports: {csv_file}; lesion tokens '
+                  + (f'ON ({len(self.nodule_boxes)} nodule boxes, {self.n_tok} token(s) per nodule)'
+                     if self.nodule_boxes else 'OFF ([SIZE#k] -> [SIZE])'))
         self.nodule_index = (
             load_nodule_index(nodule_metadata, MAX_LESION_PER_REGION,
                               pred_csv=lesion_pred_csv, order=lesion_order, with_type=lesion_type,
@@ -262,7 +281,16 @@ class RadGenomeDataset_Train(PersistentDataset):
         # and the whole point is to keep native (0.8, 0.8, 1.0) mm resolution
         # rather than the lobe pathway's downsampled view.
         lesion_crops = {}
-        if self.nodule_index is not None:
+        if self.v2 and self.nodule_boxes:
+            # v2: the lobe's own nodule list; the second field carries the nodule id
+            volume_name = os.path.basename(img_path)
+            for region in mask_paths:
+                ids = lobe_nodules(self.reports_v2, volume_name, region, self.nodule_boxes)
+                if ids:
+                    lesion_crops[region] = [
+                        (normalize_lesion(crop_lesion(img_data, self.nodule_boxes[(volume_name, n)][0])), n, None)
+                        for n in ids]
+        elif self.nodule_index is not None:
             # nodule_metadata.csv keys on Volumename, which includes the suffix
             volume_name = os.path.basename(img_path)
             for region in mask_paths:
@@ -353,7 +381,7 @@ class RadGenomeDataset_Train(PersistentDataset):
                     slot = i * MAX_LESION_PER_REGION + k
                     lesion_crop_list.append(crop)
                     lesion_slot_list.append(slot)
-                    toks.append(lesion_token_text(slot, pred_mm, self.lesion_size_unit, pred_type))
+                    toks.append(slot if self.v2 else lesion_token_text(slot, pred_mm, self.lesion_size_unit, pred_type))
                 lesion_tokens_per_slot[i] = toks
 
         if lesion_crop_list:
@@ -364,6 +392,10 @@ class RadGenomeDataset_Train(PersistentDataset):
         lesion_slots = torch.tensor(lesion_slot_list, dtype=torch.long)
 
         instruction = "Given the provided global and regional information from this CT scan, please generate a comprehensive medical report for each region. First, identify the anatomical area corresponding to each region, then provide detailed information about these anatomical structures and any abnormalities that are essential. You can refer to the global information as the context and take it as a supplement when generating each region report."
+
+        if self.v2:
+            return self._finish_v2(img_file, instruction, region2area, lesion_tokens_per_slot, lesion_crops,
+                                   mask_img_tensors, mask_tensors, lesion_x, lesion_slots)
 
         # prompt = self.text_add_image_tokens(instruction)
         prompt = self.text_add_region_tokens(instruction, num_regions=len(region2area), lesion_tokens_per_slot=lesion_tokens_per_slot)
@@ -400,6 +432,43 @@ class RadGenomeDataset_Train(PersistentDataset):
         # remove the additional special tokens from the label
         label[label >= self.voc_size] = -100
         label[:prompt_length] = -100  # only focus on answer part
+
+        return {'lang_x': text_input,
+                'vision_x': mask_img_tensors,
+                'mask_x': mask_tensors,
+                'region2area': region2area,
+                'lesion_x': lesion_x,
+                'lesion_slots': lesion_slots,
+                'attention_mask': attention_mask,
+                'label': label
+                }
+
+    # ------------------------------------------------------------------ GT v2
+    def _finish_v2(self, img_file, instruction, region2area, slots_per_region, lesion_crops,
+                   mask_img_tensors, mask_tensors, lesion_x, lesion_slots):
+        volume = os.path.basename(img_file)
+        prompt, combined_report, spans, _ = build_v2_text(self, volume, instruction, region2area,
+                                                          slots_per_region, lesion_crops)
+        self.text_tokenizer.padding_side = "right"
+        full = prompt + ' ' + combined_report
+        text_tensor = self.text_tokenizer(full, max_length=self.max_seq, truncation=True, padding="max_length",
+                                          return_tensors="pt")
+        text_input = text_tensor["input_ids"][0]
+        attention_mask = text_tensor["attention_mask"][0]
+        n_real = int(torch.sum(attention_mask))
+        if n_real < self.max_seq:
+            text_input[n_real] = self.text_tokenizer.eos_token_id  # same as v1: eos after the last token
+
+        prompt_length = int(torch.sum(self.text_tokenizer(prompt, max_length=self.max_seq, truncation=True,
+                                                          return_tensors="pt")["attention_mask"][0]))
+        label = text_input.clone()
+        label[label == self.text_tokenizer.pad_token_id] = -100
+        label[label >= self.voc_size] = -100
+        label[:prompt_length] = -100
+        off = len(prompt) + 1
+        masked = token_mask_for_spans(self.text_tokenizer, full, [(off + a, off + b) for a, b in spans],
+                                      len(label), self.max_seq)
+        label[masked] = -100
 
         return {'lang_x': text_input,
                 'vision_x': mask_img_tensors,

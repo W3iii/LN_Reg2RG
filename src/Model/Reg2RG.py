@@ -2,7 +2,7 @@ from torch import nn
 from transformers.models.llama import LlamaForCausalLM
 from peft import get_peft_model, LoraConfig, TaskType
 from .my_embedding_layer import MyEmbedding
-from regions import lesion_token_names
+from regions import lesion_token_names, tokens_per_lesion
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 import tqdm.auto as tqdm
 import torch.nn as nn
@@ -50,7 +50,7 @@ class Reg2RG(nn.Module):
         # docs/LESION_TOKENS.md §1: must be appended after every <region*> entry,
         # and this list must match the two Dataset classes' exactly (rule 1 there).
         special_token["additional_special_tokens"].extend(
-            lesion_token_names(max_region_size))
+            lesion_token_names(max_region_size, tokens_per_lesion(lesion_arch)))
 
         self.text_tokenizer.add_special_tokens(
             special_token

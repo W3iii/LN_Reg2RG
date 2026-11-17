@@ -137,12 +137,69 @@ class PooledLesionEncoder(nn.Module):
         return self.fc(torch.cat([loc, glob], 1))
 
 
-LESION_ARCHS = ('gap', 'center', 'attn')
+class QueryLesionEncoder(nn.Module):
+    """vitq: a small 3D ViT over the native-resolution crop, read out by learnable attribute queries.
+
+    One token per attribute query instead of one pooled vector:
+
+        crop (1, 64, 64, 32) at native (0.8, 0.8, 1.0) mm
+        -> conv stem, two stride-2 stages -> 16x16x8 patch grid (3.2 x 3.2 x 4 mm per cell,
+           the same grid PooledLesionEncoder pools; a ~5 mm nodule spans 1-2 cells, not
+           0.117 of a RadFM patch)
+        -> `depth` pre-norm transformer layers with a learned 3D position embedding
+        -> `n_queries` learnable queries cross-attend to the patch tokens (queries = Q,
+           patch tokens = K/V) in `dec_depth` decoder layers
+        -> LayerNorm + Linear to the LLM width: (N, n_queries, dim)
+
+    Query order is fixed and the pretraining heads in evaluation/train_lesion_encoder.py
+    sit on it: token 0 -> size, token 1 -> type, token 2 -> TW Lung-RADS. In the report
+    model the heads are gone and all three tokens go into the prompt
+    (regions.TOKENS_PER_LESION['vitq'] == 3).
+
+    Attribute names must stay as they are: train_lesion_encoder.py saves this class's
+    state_dict and MyEmbedding loads it by key.
+    """
+    QUERY_NAMES = ('size', 'type', 'rads')
+
+    def __init__(self, dim=4096, width=32, d_model=256, depth=4, heads=8, dec_depth=2,
+                 n_queries=3, grid=(16, 16, 8)):
+        super().__init__()
+        self.n_tokens = n_queries
+        self.stem = nn.Sequential(_conv_block(1, width, 2), _conv_block(width, width * 2, 2),
+                                  _conv_block(width * 2, d_model, 1))
+        self.grid = tuple(grid)
+        self.pos = nn.Parameter(torch.zeros(1, grid[0] * grid[1] * grid[2], d_model))
+        nn.init.trunc_normal_(self.pos, std=0.02)
+        enc = nn.TransformerEncoderLayer(d_model, heads, 4 * d_model, dropout=0.0, activation='gelu',
+                                         batch_first=True, norm_first=True)
+        self.encoder = nn.TransformerEncoder(enc, depth, enable_nested_tensor=False)
+        self.queries = nn.Parameter(torch.zeros(1, n_queries, d_model))
+        nn.init.trunc_normal_(self.queries, std=0.02)
+        dec = nn.TransformerDecoderLayer(d_model, heads, 4 * d_model, dropout=0.0, activation='gelu',
+                                         batch_first=True, norm_first=True)
+        self.decoder = nn.TransformerDecoder(dec, dec_depth)
+        self.norm = nn.LayerNorm(d_model)
+        self.fc = nn.Linear(d_model, dim)
+
+    def forward(self, x):
+        # x: (N, 1, 64, 64, 32) -> (N, n_queries, dim)
+        f = self.stem(x)                                     # (N, d_model, 16, 16, 8)
+        if tuple(f.shape[2:]) != self.grid:
+            raise ValueError(f'patch grid {tuple(f.shape[2:])} != {self.grid}: crop size changed?')
+        t = f.flatten(2).transpose(1, 2) + self.pos.to(f.dtype)
+        t = self.encoder(t)
+        q = self.decoder(self.queries.to(t.dtype).expand(x.shape[0], -1, -1), t)
+        return self.fc(self.norm(q))
+
+
+LESION_ARCHS = ('gap', 'center', 'attn', 'vitq')
 
 
 def build_lesion_encoder(arch='gap', dim=4096):
     if arch == 'gap':
         return LesionEncoder(dim=dim)
+    if arch == 'vitq':
+        return QueryLesionEncoder(dim=dim)
     return PooledLesionEncoder(arch, dim=dim)
 
 
@@ -240,6 +297,7 @@ class MyEmbedding(nn.Module):
         # LM loss cannot wash out what it learned.
         self.lesion_arch = lesion_arch
         self.lesion_encoder = build_lesion_encoder(lesion_arch, dim=self.embedding_dim)
+        self.lesion_tokens = getattr(self.lesion_encoder, 'n_tokens', 1)
         if lesion_encoder_ckpt:
             load_pretrained_lesion_encoder(self.lesion_encoder, lesion_encoder_ckpt, lesion_arch)
         if freeze_lesion_encoder:
@@ -344,15 +402,22 @@ class MyEmbedding(nn.Module):
         # lesion_x     : (B, L, C, 64, 64, 32), L = max lesions in this batch
         # lesion_slots : (B, L) int, flat region*MAX_LESION_PER_REGION+lesion
         #                index; -1 marks padding
+        # An encoder with n_tokens > 1 (vitq) gives each nodule slot s the rows
+        # s*n_tokens .. s*n_tokens+n_tokens-1 (regions.lesion_token_names).
+        n_tok = self.lesion_tokens
         lesion_embedding = torch.zeros(
-            (B, max_region * MAX_LESION_PER_REGION, self.embedding_dim),
+            (B, max_region * MAX_LESION_PER_REGION * n_tok, self.embedding_dim),
             device=text_input.device, dtype=self.weight.dtype)
         if lesion_x is not None and lesion_slots is not None:
             for i in range(B):
                 valid = lesion_slots[i] >= 0
                 if valid.any():
                     tok = self.lesion_encoder(lesion_x[i][valid])
-                    lesion_embedding[i, lesion_slots[i][valid]] = tok
+                    if tok.dim() == 2:
+                        tok = tok.unsqueeze(1)                     # (n, 1, dim)
+                    rows = (lesion_slots[i][valid].unsqueeze(1) * n_tok
+                            + torch.arange(n_tok, device=tok.device).unsqueeze(0))
+                    lesion_embedding[i, rows.reshape(-1)] = tok.reshape(-1, self.embedding_dim).to(lesion_embedding.dtype)
 
         embedding_weight = torch.cat([self.weight, self.image_token_weight, self.region_token_weight], dim=0)  # num_embeddings+2, embedding_dim
         embedding_weight = embedding_weight.unsqueeze(0).repeat(B, 1, 1)  # B, num_embeddings+2, embedding_dim

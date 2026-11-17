@@ -43,7 +43,7 @@ from sklearn.model_selection import GroupKFold
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from train_lesion_encoder import (Net, Objective, TypeTargets, TYPES, add_loss_args, build_cache,   # noqa: E402
+from train_lesion_encoder import (DEFAULT_TYPE_CSV, Net, Objective, TypeTargets, TYPES, add_loss_args, build_cache,   # noqa: E402
                                   checkpoint, concept_suffix, eval_loader, evaluate, fmt_cbm, fmt_type, make_optim, one_cycle,
                                   pretrain_g, train_loader)
 
@@ -99,6 +99,8 @@ def main():
     ap.add_argument('--workers', type=int, default=4)
     ap.add_argument('--out', default=None)
     a = ap.parse_args()
+    # B3c-B3g tool, old split only (nodule_metadata.csv); the v2 pipeline fills sizes from masks
+    a.type_csv = a.type_csv or DEFAULT_TYPE_CSV
 
     if not os.path.exists(a.cache):
         build_cache(a.data_root, os.path.join(a.data_root, 'nodule_metadata.csv'), a.cache,

@@ -13,7 +13,7 @@ class ModelArguments:
     pretrained_adapter: Optional[str] = field(
         default="/jhcnas5/chenzhixuan/MyOpenSource/huggingface/Reg2RG/RadFM_perceiver_fc.pth")
     # Lesion encoder (src/Model/my_embedding_layer.py). gap = original B2 encoder.
-    lesion_arch: str = field(default='gap', metadata={'help': 'gap | center | attn'})
+    lesion_arch: str = field(default='gap', metadata={'help': 'gap | center | attn | vitq (3 tokens per nodule)'})
     lesion_encoder_ckpt: Optional[str] = field(default='', metadata={'help': 'best.pt from evaluation/train_lesion_encoder.py'})
     freeze_lesion_encoder: bool = field(default=False)
 
@@ -26,6 +26,9 @@ class DataArguments:
     # Empty = lesion tokens off (the B0 baseline). Point it at nodule_metadata.csv
     # to run the B2 lesion arm; see docs/LESION_TOKENS.md.
     nodule_metadata: Optional[str] = field(default='')
+    # GT v2 / split C: point report_file at region_report_v2_<split>.csv (detected from its
+    # nodule_ids / loss_mask columns) and nodule_metadata at nodule_metadata_v2.csv.
+    # Sizes are [SIZE#k] placeholders filled from the masks; the B3c-B3g options below are v1-only.
     # B3c: predicted sizes in the prompt ('<lesionK> (~X mm)') and label-free
     # lesion ordering. Empty csv + 'truth' = B2/B3a behaviour.
     lesion_pred_csv: Optional[str] = field(default='')

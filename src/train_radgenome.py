@@ -12,7 +12,7 @@ import numpy as np
 import torch              
 import random
 
-from regions import REGIONS
+from regions import REGIONS, tokens_per_lesion
 
 @dataclass
 class DataCollator(object):
@@ -130,6 +130,8 @@ def main():
         size_placeholder=data_args.size_placeholder,
         lesion_type=data_args.lesion_type,
         lesion_type_min_conf=data_args.lesion_type_min_conf,
+        # vitq gives each nodule 3 prompt tokens; must match the model built below
+        lesion_tokens_per_nodule=tokens_per_lesion(model_args.lesion_arch),
     )
 
     print("Setup Model")

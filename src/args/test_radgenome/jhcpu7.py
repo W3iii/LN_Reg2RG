@@ -15,7 +15,7 @@ class ModelArguments:
     ckpt_path: Optional[str] = field(   
         default="/jhcnas5/chenzhixuan/MyOpenSource/huggingface/Reg2RG/pytorch_model.bin")
     # Must match the checkpoint's training arm, or load_state_dict(strict=True) fails.
-    lesion_arch: str = field(default='gap', metadata={'help': 'gap | center | attn'})
+    lesion_arch: str = field(default='gap', metadata={'help': 'gap | center | attn | vitq (3 tokens per nodule)'})
 
 @dataclass
 class DataArguments:
@@ -27,6 +27,9 @@ class DataArguments:
     # tokens and evaluated without them (or the reverse) gets a prompt whose
     # <lesion*> ids point at zero embeddings, and nothing raises.
     nodule_metadata: Optional[str] = field(default='')
+    # GT v2 / split C: point report_file at region_report_v2_<split>.csv (detected from its
+    # nodule_ids / loss_mask columns) and nodule_metadata at nodule_metadata_v2.csv.
+    # Sizes are [SIZE#k] placeholders filled from the masks; the B3c-B3g options below are v1-only.
     # Must match training too (B3c): same prediction csv, same order.
     lesion_pred_csv: Optional[str] = field(default='')
     lesion_order: str = field(default='truth', metadata={'help': 'truth | pred'})

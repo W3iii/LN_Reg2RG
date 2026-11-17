@@ -106,3 +106,58 @@ def fill_report(report, region2area, preds_by_area):
         n_unf += unf
         out.append(f'The region {slot} is ' + body)
     return ''.join(out), n_ph, n_unf
+
+
+# ---------------------------------------------------------------- v2 (indexed placeholders)
+# GT v2 (region_report_v2_*.csv) writes a size that belongs to exactly one nodule as
+# [SIZE#<nodule_id>] and any other size (group descriptions, lesions with no mask) as
+# [SIZE]. nodule_id is a dataset-wide id the LLM cannot know, so the Dataset rewrites it
+# to the nodule's 1-based position k in its lobe's lesion list -- the same "#k" that
+# labels the nodule's lesion tokens in the prompt:
+#     prompt  ... The region 2 is <region>..</region> with lesions #1 <lesion16>, #2 <lesion17>.
+#     target  The region 2 is right lower lobe: A [SIZE#2] solid nodule ...
+# At inference [SIZE#k] in region i's text gets the mask size of region i's k-th nodule;
+# a bare [SIZE] gets the old largest-first rule.
+INDEXED = re.compile(r'\[SIZE#(\d+)\]')
+
+
+def localize_size_ids(text, ids):
+    """[SIZE#<nodule_id>] -> [SIZE#<k>] (k = 1-based position in ids); an id not in ids -> [SIZE]."""
+    pos = {int(n): k for k, n in enumerate(ids, 1)}
+    return INDEXED.sub(lambda m: f'[SIZE#{pos[int(m.group(1))]}]' if int(m.group(1)) in pos else PLACEHOLDER, text)
+
+
+def unindex_sizes(text):
+    """[SIZE#k] -> [SIZE] (runs without lesion tokens: the model has nothing to point at)."""
+    return INDEXED.sub(PLACEHOLDER, text)
+
+
+def fill_indexed(text, sizes_mm):
+    """One lobe: [SIZE#k] -> size of the lobe's k-th nodule, then bare [SIZE] largest-first.
+    Returns (filled_text, n_placeholders, n_unfilled). An index past the lobe's nodule list
+    falls back to the bare rule."""
+    n_ph = len(INDEXED.findall(text)) + text.count(PLACEHOLDER)
+
+    def one(m):
+        k = int(m.group(1))
+        return format_size(sizes_mm[k - 1]) if 1 <= k <= len(sizes_mm) else PLACEHOLDER
+    text = INDEXED.sub(one, text)
+    text, unfilled = fill_sizes(text, sizes_mm)
+    return text, n_ph, unfilled
+
+
+def fill_report_v2(report, sizes_by_slot):
+    """Fill a generated v2 report, segment by 'The region i is ...:'.
+    sizes_by_slot: region slot i -> eq. diameters (mm) of that slot's nodules, in lesion-slot order.
+    Returns (filled_report, n_placeholders, n_unfilled)."""
+    pieces = _REGION.split(report)
+    if len(pieces) < 3:
+        n = len(INDEXED.findall(report)) + report.count(PLACEHOLDER)
+        return report, n, n
+    out, n_ph, n_unf = [pieces[0]], 0, 0
+    for k in range(1, len(pieces) - 1, 2):
+        slot, body = int(pieces[k]), pieces[k + 1]
+        body, ph, unf = fill_indexed(body, sizes_by_slot.get(slot, []))
+        n_ph += ph; n_unf += unf
+        out.append(f'The region {slot} is ' + body)
+    return ''.join(out), n_ph, n_unf

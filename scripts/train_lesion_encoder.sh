@@ -11,6 +11,11 @@
 #     -> outputs/lesion_enc_attn_ce_mil_cbm_seed0/, log ..._ce_mil_cbm_seed0.log
 #   TYPE_LOSSES=ce_mil CONCEPT=frozen bash scripts/train_lesion_encoder.sh   # arm C: g pretrained + frozen, grade loss -> type head
 #     -> outputs/lesion_enc_attn_ce_mil_cbmfrozen_seed0/
+#
+# Split C / v2 metadata (ME train+val only; crops cached as lesion_crops_trainval_nodule_metadata_v2.npy):
+#   ARCHS=vitq TYPE_LOSSES=ce_mil META=$DATA_ROOT/nodule_metadata_v2.csv bash scripts/train_lesion_encoder.sh
+#     -> outputs/lesion_enc_vitq_ce_mil_v2_seed0/best.pt  (the default ckpt of configs/train_radgenome/ncku_a100_v2.sh)
+#   ARCHS="vitq attn" ... compares the 3-query ViT with the pooled CNN on the same split
 set -eu
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 export PYTHONWARNINGS=ignore
@@ -27,6 +32,9 @@ MIL_WARMUP="${MIL_WARMUP:-10}"
 CONCEPT="${CONCEPT:-0}"
 W_CBM="${W_CBM:-1.0}"
 W_CONSIST="${W_CONSIST:-0.1}"
+META="${META:-}"                       # empty = $DATA_ROOT/nodule_metadata.csv (old split)
+META_ARGS=""; META_SFX=""
+if [ -n "$META" ]; then META_ARGS="--meta $META"; META_SFX="_v2"; fi
 case "$CONCEPT" in
   1|joint) CBM_ARGS="--concept joint --w_cbm $W_CBM --w_consist $W_CONSIST"; CBM_SFX=_cbm ;;
   frozen)  CBM_ARGS="--concept frozen --w_cbm ${W_CBM_FROZEN:-0.3}"; CBM_SFX=_cbmfrozen ;;
@@ -35,12 +43,13 @@ esac
 mkdir -p outputs/seed_sweep_logs
 for arch in $ARCHS; do
   for tl in $TYPE_LOSSES; do
-    log="outputs/seed_sweep_logs/lesion_enc_${arch}_${tl}${CBM_SFX}_seed${SEED}.log"
+    log="outputs/seed_sweep_logs/lesion_enc_${arch}_${tl}${CBM_SFX}${META_SFX}_seed${SEED}.log"
     LOGS="${LOGS:-} $log"
     echo "=== $arch type_loss=$tl concept=$CONCEPT -> $log"
     CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" "$PY" evaluation/train_lesion_encoder.py \
         --arch "$arch" --type_loss "$tl" --data_root "$DATA_ROOT" --epochs "$EPOCHS" --seed "$SEED" \
-        --w_type "$W_TYPE" --w_mil "$W_MIL" --mil_warmup "$MIL_WARMUP" $CBM_ARGS 2>&1 | tee "$log"
+        --w_type "$W_TYPE" --w_mil "$W_MIL" --mil_warmup "$MIL_WARMUP" $CBM_ARGS $META_ARGS \
+        ${META:+--out outputs/lesion_enc_${arch}_${tl}${CBM_SFX}${META_SFX}_seed${SEED}} 2>&1 | tee "$log"
   done
 done
 echo

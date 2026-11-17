@@ -17,6 +17,12 @@ Sources, strongest first
 
 Only train and val are parsed. Test reports are never read: test rows get no label.
 
+v2 metadata (nodule_metadata_v2.csv, split C, has a match_tier column):
+  * lobe text comes from region_report_v2_{train,val}.csv, minus lobes with loss_mask = 0
+    (their text describes a lesion with no mask, so a type word there may belong to it)
+  * a nodule's own sentence is used only for match tiers A and B; C (bilateral group
+    description) and X (non-nodular finding) sentences are not about this nodule alone
+
 Writes one row per nodule (all splits):
   Volumename, nodule_id, split, lobe, type_set ('GGO|solid', '' = none),
   type_label (0..3 when type_set is a single type, else -1), type_source,
@@ -92,9 +98,14 @@ def fmt(s):
     return '|'.join(TYPES[i] for i in sorted(s))
 
 
-def build(data_root, out_csv=None):
-    nm = pd.read_csv(os.path.join(data_root, 'nodule_metadata.csv'))
-    rr = pd.concat([pd.read_csv(os.path.join(data_root, f'region_report_{s}.csv')) for s in ('train', 'val')])
+def build(data_root, out_csv=None, meta_csv=None):
+    nm = pd.read_csv(meta_csv or os.path.join(data_root, 'nodule_metadata.csv'))
+    v2 = 'match_tier' in nm.columns
+    rr = pd.concat([pd.read_csv(os.path.join(data_root, f'region_report_{"v2_" if v2 else ""}{s}.csv'))
+                    for s in ('train', 'val')])
+    if v2:
+        rr = rr[rr['loss_mask'].fillna(1).astype(int) == 1]
+        nm = nm.assign(matched_sentence=nm['matched_sentence'].where(nm['match_tier'].isin(['A', 'B'])))
     rr = rr.dropna(subset=['Anatomy', 'Sentence'])
     rr = rr.assign(Anatomy=rr['Anatomy'].str.lower()).groupby(['Volumename', 'Anatomy'])['Sentence'].agg(' '.join)
     lobe_text = rr.to_dict()
@@ -160,8 +171,9 @@ def summary(res):
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--data_root', default='/root/notebooks/groups/BME/reg2rg_nifti')
+    ap.add_argument('--meta', default=None, help='default <data_root>/nodule_metadata.csv; split C: nodule_metadata_v2.csv')
     ap.add_argument('--out', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'outputs', 'nodule_type.csv'))
     a = ap.parse_args()
-    res = build(a.data_root, a.out)
+    res = build(a.data_root, a.out, meta_csv=a.meta)
     summary(res)
     print(f'wrote {a.out}')

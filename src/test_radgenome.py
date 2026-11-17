@@ -6,6 +6,7 @@ import transformers
 from dataclasses import dataclass, field
 from Model.Reg2RG import Reg2RG
 from Dataset.radgenome_dataset_test import RadGenomeDataset_Test
+from Dataset.report_v2 import is_v2_csv
 # from args.test_combined_region_radgenome.superpod import ModelArguments, DataArguments
 from args.test_radgenome.jhcpu7 import ModelArguments, DataArguments
 import torch
@@ -16,8 +17,9 @@ import random
 import numpy as np
 import pandas as pd
 
-from regions import REGIONS
-from size_placeholder import fill_report
+import json
+from regions import REGIONS, tokens_per_lesion
+from size_placeholder import fill_report, fill_report_v2
 
 @dataclass
 class DataCollator(object):
@@ -25,6 +27,9 @@ class DataCollator(object):
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         #print(instances) 'loss_reweight': reweight_tensor, 'key_words_query': emphasize_words
         acc_nums, lang_xs, vision_xs, mask_xs, region2areas, lesion_xs, lesion_slots_list, questions, gt_combined_reports = tuple([instance[key] for instance in instances] for key in ('acc_num', 'lang_x','vision_x', 'mask_x', 'region2area', 'lesion_x', 'lesion_slots', 'question', 'gt_combined_report'))
+        # v2 extras (GT filled from masks, sizes for filling the prediction, loss-masked lobes)
+        extras = {k: [instance[k] for instance in instances]
+                  for k in ('gt_filled_report', 'sizes_by_slot', 'masked_regions') if k in instances[0]}
 
         lang_xs = torch.cat([_.unsqueeze(0) for _ in lang_xs], dim = 0)
 
@@ -90,6 +95,7 @@ class DataCollator(object):
             lesion_slots = lesion_slots,
             question = questions,
             gt_combined_report = gt_combined_reports,
+            **extras,
         )
 
 def setup_seed(seed):
@@ -111,8 +117,14 @@ def main():
     print(model_args.ckpt_path)
     
     # 判断结果保存路径是否存在，不存在则创建
+    v2 = is_v2_csv(data_args.report_file)
     columns = ["AccNum", "Question", "GT_combined_report", "Pred_combined_report"]
-    if data_args.size_placeholder:
+    if v2:
+        # GT_combined_report / Pred_combined_report are filled with mask sizes (what evaluation
+        # reads); the raw [SIZE#k] texts are kept beside them. Masked_regions: lobes whose GT
+        # text describes a lesion with no mask (loss_mask = 0) -- exclude them from scoring.
+        columns += ["GT_raw_report", "Pred_raw_report", "n_size_slots", "n_unfilled", "Masked_regions"]
+    elif data_args.size_placeholder:
         # Pred_combined_report is the filled report (what every evaluation reads);
         # the raw generation with its [SIZE] slots is kept beside it.
         columns += ["Pred_raw_report", "n_size_slots", "n_unfilled"]
@@ -127,7 +139,7 @@ def main():
         df = pd.DataFrame(columns=columns)
         df.to_csv(data_args.result_path, index=False)
         inferenced_id = []
-    if data_args.size_placeholder and not data_args.lesion_pred_csv:
+    if data_args.size_placeholder and not data_args.lesion_pred_csv and not v2:
         raise SystemExit('size_placeholder needs lesion_pred_csv: the [SIZE] slots are filled from it')
 
     print("Setup Data")
@@ -144,6 +156,7 @@ def main():
         lesion_size_unit=data_args.lesion_size_unit,
         lesion_type=data_args.lesion_type,
         lesion_type_min_conf=data_args.lesion_type_min_conf,
+        lesion_tokens_per_nodule=tokens_per_lesion(model_args.lesion_arch),
     )
 
     Test_dataloader = DataLoader(
@@ -197,7 +210,13 @@ def main():
         
         # 将数据添加到DataFrame中并保存到CSV文件
         row = [acc_num, question, gt_combined_report, pred_combined_report]
-        if data_args.size_placeholder:
+        if v2:
+            sizes = sample["sizes_by_slot"][0]
+            filled, n_slots, n_unfilled = fill_report_v2(pred_combined_report, sizes)
+            print('Pred_filled: ', filled, f'({n_slots} size slots, {n_unfilled} unfilled)')
+            row = [acc_num, question, sample["gt_filled_report"][0], filled, gt_combined_report,
+                   pred_combined_report, n_slots, n_unfilled, json.dumps(sample["masked_regions"][0])]
+        elif data_args.size_placeholder:
             r2a = region2area[0] if isinstance(region2area, (list, tuple)) else region2area
             preds_by_area = {area: [mm for _, mm, _ in Test_dataset.nodule_index.get((acc_num, area), [])]
                              for area in r2a.values()}

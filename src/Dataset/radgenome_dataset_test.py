@@ -17,13 +17,15 @@ import random
 import pickle
 
 from regions import REGIONS, MAX_LESION_PER_REGION, lesion_token_names
-from lesion_utils import load_nodule_index, crop_lesion, normalize_lesion, lesion_token_text
+from lesion_utils import load_nodule_index, load_nodule_boxes, crop_lesion, normalize_lesion, lesion_token_text
+from size_placeholder import fill_report_v2
+from Dataset.report_v2 import is_v2_csv, load_v2_reports, lobe_nodules, build_v2_text
 
 class RadGenomeDataset_Test(PersistentDataset):
     # See the note in radgenome_dataset_train.py: nodule_metadata=None means
     # lesion tokens are off, and inference must be run with the same setting the
     # checkpoint was trained under.
-    def __init__(self, text_tokenizer, data_folder, mask_folder, csv_file, cache_dir, inferenced_id, max_region_size=5, max_img_size = 1, image_num = 32, region_num=33, max_seq=2048, resize_dim=500, voc_size=32000, force_num_frames=True, nodule_metadata=None, lesion_pred_csv=None, lesion_order='truth', lesion_size_unit='mm', lesion_type=False, lesion_type_min_conf=0.0):
+    def __init__(self, text_tokenizer, data_folder, mask_folder, csv_file, cache_dir, inferenced_id, max_region_size=5, max_img_size = 1, image_num = 32, region_num=33, max_seq=2048, resize_dim=500, voc_size=32000, force_num_frames=True, nodule_metadata=None, lesion_pred_csv=None, lesion_order='truth', lesion_size_unit='mm', lesion_type=False, lesion_type_min_conf=0.0, lesion_tokens_per_nodule=1):
         self.inferenced_id = inferenced_id
         # text_tokenizer
         self.text_tokenizer = AutoTokenizer.from_pretrained(
@@ -59,8 +61,9 @@ class RadGenomeDataset_Test(PersistentDataset):
         # and this list must match Reg2RG.py and radgenome_dataset_train.py exactly
         # (rule 1 there) -- a mismatch doesn't raise, it just selects the wrong
         # embedding row.
+        self.n_tok = lesion_tokens_per_nodule          # == regions.tokens_per_lesion(lesion_arch)
         special_token["additional_special_tokens"].extend(
-            lesion_token_names(max_region_size))
+            lesion_token_names(max_region_size, self.n_tok))
 
         self.text_tokenizer.add_special_tokens(
             special_token
@@ -73,6 +76,17 @@ class RadGenomeDataset_Test(PersistentDataset):
         self.text_tokenizer.eos_token_id = 2
 
         self.max_region_size = max_region_size
+        # GT v2 / split C: see radgenome_dataset_train.py and Dataset/report_v2.py
+        self.v2 = is_v2_csv(csv_file)
+        self.nodule_boxes = None
+        if self.v2:
+            if lesion_pred_csv or lesion_type:
+                raise ValueError('v2 report CSV: lesion_pred_csv / lesion_type are v1 options')
+            self.reports_v2 = load_v2_reports(csv_file)
+            self.nodule_boxes = load_nodule_boxes(nodule_metadata) if nodule_metadata else None
+            nodule_metadata = None
+            print(f'[dataset] v2 reports: {csv_file}; lesion tokens '
+                  + (f'ON ({self.n_tok} token(s) per nodule)' if self.nodule_boxes else 'OFF'))
         self.nodule_index = (
             load_nodule_index(nodule_metadata, MAX_LESION_PER_REGION,
                               pred_csv=lesion_pred_csv, order=lesion_order, with_type=lesion_type,
@@ -228,7 +242,16 @@ class RadGenomeDataset_Test(PersistentDataset):
         # Lesion crops -- see radgenome_dataset_train.py. img_data is a tensor
         # here, so hand crop_lesion the underlying array.
         lesion_crops = {}
-        if self.nodule_index is not None:
+        if self.v2 and self.nodule_boxes:
+            volume_name = os.path.basename(img_path)
+            img_data_np = img_data.numpy()
+            for region in mask_paths:
+                ids = lobe_nodules(self.reports_v2, volume_name, region, self.nodule_boxes)
+                if ids:
+                    lesion_crops[region] = [
+                        (normalize_lesion(crop_lesion(img_data_np, self.nodule_boxes[(volume_name, n)][0])), n, None)
+                        for n in ids]
+        elif self.nodule_index is not None:
             volume_name = os.path.basename(img_path)
             img_data_np = img_data.numpy()
             for region in mask_paths:
@@ -321,7 +344,7 @@ class RadGenomeDataset_Test(PersistentDataset):
                     slot = i * MAX_LESION_PER_REGION + k
                     lesion_crop_list.append(crop)
                     lesion_slot_list.append(slot)
-                    toks.append(lesion_token_text(slot, pred_mm, self.lesion_size_unit, pred_type))
+                    toks.append(slot if self.v2 else lesion_token_text(slot, pred_mm, self.lesion_size_unit, pred_type))
                 lesion_tokens_per_slot[i] = toks
 
         if lesion_crop_list:
@@ -332,6 +355,10 @@ class RadGenomeDataset_Test(PersistentDataset):
         lesion_slots = torch.tensor(lesion_slot_list, dtype=torch.long)
 
         instruction = "Given the provided global and regional information from this CT scan, please generate a comprehensive medical report for each region. First, identify the anatomical area corresponding to each region, then provide detailed information about these anatomical structures and any abnormalities that are essential. You can refer to the global information as the context and take it as a supplement when generating each region report."
+
+        if self.v2:
+            return self._finish_v2(index, img_file, instruction, region2area, lesion_tokens_per_slot, lesion_crops,
+                                   mask_img_tensors, mask_tensors, lesion_x, lesion_slots)
 
         # prompt = self.text_add_image_tokens(instruction)
         prompt = self.text_add_region_tokens(instruction, num_regions=len(region2area), lesion_tokens_per_slot=lesion_tokens_per_slot)
@@ -359,4 +386,31 @@ class RadGenomeDataset_Test(PersistentDataset):
                 'lesion_slots': lesion_slots,
                 'question': prompt,
                 'gt_combined_report': combined_report
+                }
+
+    def _finish_v2(self, index, img_file, instruction, region2area, slots_per_region, lesion_crops,
+                   mask_img_tensors, mask_tensors, lesion_x, lesion_slots):
+        """v2 sample: the prompt as in training (no shuffle here), the placeholder GT, the GT filled
+        from the masks, and what inference needs to fill the prediction the same way."""
+        volume = os.path.basename(img_file)
+        prompt, combined_report, _, sizes = build_v2_text(self, volume, instruction, region2area,
+                                                          slots_per_region, lesion_crops)
+        gt_filled = fill_report_v2(combined_report, sizes)[0] if sizes else combined_report
+        rep = self.reports_v2.get(volume, {})
+        masked = [region2area[i] for i in range(len(region2area))
+                  if rep.get(region2area[i], {}).get('loss_mask', 1) == 0]
+        text_input = self.text_tokenizer(prompt, max_length=self.max_seq, truncation=True,
+                                         return_tensors="pt")["input_ids"][0]
+        return {'acc_num': self.data[index]['accnum'],
+                'lang_x': text_input,
+                'vision_x': mask_img_tensors,
+                'mask_x': mask_tensors,
+                'region2area': region2area,
+                'lesion_x': lesion_x,
+                'lesion_slots': lesion_slots,
+                'question': prompt,
+                'gt_combined_report': combined_report,
+                'gt_filled_report': gt_filled,
+                'sizes_by_slot': sizes,
+                'masked_regions': masked,
                 }

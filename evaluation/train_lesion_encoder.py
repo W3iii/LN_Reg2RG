@@ -21,9 +21,16 @@ This script tests both fixes before paying for another 4.5 h LLM run:
     --arch center   same convs, keep 16x16x8 resolution, Gaussian-weighted pool
                     centred on the nodule, concatenated with the global pool
     --arch attn     same trunk, learned spatial-attention pool + centre-distance bias
+    --arch vitq     small 3D ViT on the 16x16x8 grid + 3 learnable attribute queries
+                    (QueryLesionEncoder): token 0 -> size head, 1 -> type head, 2 -> RADS head
 
-All three emit the same 4096-d token, and the auxiliary heads sit on that token,
-so whatever is learned is in the vector the LLM would receive.
+gap/center/attn emit one 4096-d token and all heads sit on it; vitq emits three and each
+head sits on its own token. Either way the heads read exactly what the LLM would receive.
+
+Data (split C, 2026-11): --meta $DATA_ROOT/nodule_metadata_v2.csv. Only train / val rows with
+a TW_Lung_RADS grade are cached, i.e. ME only; LDCT is test_ldct and never read here. The
+crop cache and the type labels are named after the metadata file, so the old-split cache
+(lesion_crops_trainval.npy, outputs/nodule_type.csv) is never reused by a v2 run.
 
 Losses
     L = SmoothL1(log size)                       all nodules
@@ -86,7 +93,7 @@ sys.path.insert(0, os.path.join(HERE, '..', 'src'))
 sys.path.insert(0, os.path.join(HERE, '..', 'data_prep'))
 sys.path.insert(0, HERE)
 
-from Model.my_embedding_layer import LesionEncoder, PooledLesionEncoder  # noqa: E402  (single source: MyEmbedding loads these state_dicts)
+from Model.my_embedding_layer import LesionEncoder, PooledLesionEncoder, QueryLesionEncoder  # noqa: E402  (single source: MyEmbedding loads these state_dicts)
 from lesion_utils import crop_lesion, normalize_lesion, BBOX_COLS  # noqa: E402
 from extract_lesion_features import find_image                    # noqa: E402
 from build_nodule_type import TYPES, build as build_type_labels   # noqa: E402
@@ -96,6 +103,25 @@ DEFAULT_TYPE_CSV = os.path.join(HERE, '..', 'outputs', 'nodule_type.csv')
 
 
 # ------------------------------------------------------------------ data
+def cache_matches(cache, meta_csv, splits=('train', 'val')):
+    """The cache's rows must be exactly the current metadata's train/val nodules, same split."""
+    c = pd.read_csv(cache + '.csv')
+    nm = pd.read_csv(meta_csv)
+    nm = nm[nm['split'].isin(list(splits))].dropna(subset=BBOX_COLS + ['eq_diam_mm', 'tw_lung_rads'])
+    a = c[['Volumename', 'nodule_id', 'split']].astype(str).reset_index(drop=True)
+    b = nm[['Volumename', 'nodule_id', 'split']].astype(str).reset_index(drop=True)
+    return a.equals(b)
+
+
+def default_paths(meta_csv):
+    """(crop cache, type csv) for a metadata file; the original file keeps its original names."""
+    tag = os.path.splitext(os.path.basename(meta_csv))[0]
+    out = os.path.join(HERE, '..', 'outputs')
+    if tag == 'nodule_metadata':
+        return os.path.join(out, 'lesion_crops_trainval.npy'), DEFAULT_TYPE_CSV
+    return os.path.join(out, f'lesion_crops_trainval_{tag}.npy'), os.path.join(out, f'nodule_type_{tag}.csv')
+
+
 def build_cache(data_root, meta_csv, cache, splits=('train', 'val')):
     import nibabel as nib
     nm = pd.read_csv(meta_csv)
@@ -127,12 +153,12 @@ class TypeTargets:
     ments  {bag_id: [N_TYPES]-float masks}, the type sets the lobe text names
     """
 
-    def __init__(self, meta, type_csv, data_root=None):
+    def __init__(self, meta, type_csv, data_root=None, meta_csv=None):
         if not os.path.exists(type_csv):
             if data_root is None:
                 raise FileNotFoundError(type_csv)
-            print(f'[type] {type_csv} missing, building it from {data_root}')
-            build_type_labels(data_root, type_csv)
+            print(f'[type] {type_csv} missing, building it from {data_root} ({meta_csv or "nodule_metadata.csv"})')
+            build_type_labels(data_root, type_csv, meta_csv=meta_csv)
         t = pd.read_csv(type_csv, keep_default_na=False)
         if t.duplicated(['Volumename', 'nodule_id']).any():
             raise ValueError(f'{type_csv}: duplicate (Volumename, nodule_id)')
@@ -264,7 +290,12 @@ class Net(nn.Module):
 
     def __init__(self, arch):
         super().__init__()
-        self.enc = LesionEncoder(dim=4096) if arch == 'gap' else PooledLesionEncoder(arch)
+        if arch == 'gap':
+            self.enc = LesionEncoder(dim=4096)
+        elif arch == 'vitq':
+            self.enc = QueryLesionEncoder(dim=4096)
+        else:
+            self.enc = PooledLesionEncoder(arch)
         self.size_head = nn.Sequential(nn.LayerNorm(4096), nn.Linear(4096, 1))
         self.rads_head = nn.Sequential(nn.LayerNorm(4096), nn.Linear(4096, 4))
         self.type_head = nn.Sequential(nn.LayerNorm(4096), nn.Linear(4096, N_TYPES))
@@ -272,6 +303,8 @@ class Net(nn.Module):
 
     def forward(self, x):
         t = self.enc(x)
+        if t.dim() == 3:          # vitq: one token per attribute query (QueryLesionEncoder.QUERY_NAMES)
+            return self.size_head(t[:, 0])[:, 0], self.rads_head(t[:, 2]), self.type_head(t[:, 1]), t
         return self.size_head(t)[:, 0], self.rads_head(t), self.type_head(t), t
 
     def concept(self, log_mm, type_probs):
@@ -401,7 +434,8 @@ def pretrain_g(model, logd, rads, tt, idx, device, steps=4000, seed=0):
 def add_loss_args(ap):
     ap.add_argument('--type_loss', choices=['none', 'ce', 'ce_mil'], default='ce_mil',
                     help='none = size + RADS only (the B3e encoder); ce = + nodule-level type; ce_mil = + lobe-level MIL')
-    ap.add_argument('--type_csv', default=DEFAULT_TYPE_CSV, help='data_prep/build_nodule_type.py output (built if missing)')
+    ap.add_argument('--type_csv', default=None, help='data_prep/build_nodule_type.py output (built if missing); '
+                    'default outputs/nodule_type.csv for nodule_metadata.csv, outputs/nodule_type_<meta>.csv otherwise')
     ap.add_argument('--w_rads', type=float, default=1.0)
     ap.add_argument('--w_type', type=float, default=1.0)
     ap.add_argument('--w_mil', type=float, default=0.5)
@@ -514,9 +548,11 @@ def fmt_type(m):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--arch', choices=['gap', 'center', 'attn'], required=True)
+    ap.add_argument('--arch', choices=['gap', 'center', 'attn', 'vitq'], required=True)
     ap.add_argument('--data_root', default='/root/notebooks/groups/BME/reg2rg_nifti')
-    ap.add_argument('--cache', default=os.path.join(HERE, '..', 'outputs', 'lesion_crops_trainval.npy'))
+    ap.add_argument('--meta', default=None, help='nodule metadata csv (default <data_root>/nodule_metadata.csv; '
+                    'split C: <data_root>/nodule_metadata_v2.csv)')
+    ap.add_argument('--cache', default=None, help='crop cache .npy (default named after --meta)')
     ap.add_argument('--epochs', type=int, default=40)
     ap.add_argument('--bs', type=int, default=64)
     ap.add_argument('--lr', type=float, default=3e-4)
@@ -526,15 +562,23 @@ def main():
     ap.add_argument('--workers', type=int, default=4)
     a = ap.parse_args()
 
+    meta_csv = a.meta or os.path.join(a.data_root, 'nodule_metadata.csv')
+    d_cache, d_type = default_paths(meta_csv)
+    a.cache = a.cache or d_cache
+    a.type_csv = a.type_csv or d_type
     if not os.path.exists(a.cache):
-        build_cache(a.data_root, os.path.join(a.data_root, 'nodule_metadata.csv'), a.cache)
+        build_cache(a.data_root, meta_csv, a.cache)
+    elif not cache_matches(a.cache, meta_csv):
+        raise SystemExit(f'{a.cache} was built from a different nodule list / split than {meta_csv}; '
+                         f'delete it (and {a.cache}.csv) or pass another --cache')
+    print(f'[data] meta={meta_csv} cache={a.cache} type_csv={a.type_csv}')
     X = np.load(a.cache, mmap_mode='r')
     meta = pd.read_csv(a.cache + '.csv')
     logd = np.log(meta['eq_diam_mm'].to_numpy(np.float32))
     rads = (meta['tw_lung_rads'].to_numpy(np.int64) - 1)
     tr = np.flatnonzero(meta['split'].to_numpy() == 'train')
     va = np.flatnonzero(meta['split'].to_numpy() == 'val')
-    tt = TypeTargets(meta, a.type_csv, a.data_root)
+    tt = TypeTargets(meta, a.type_csv, a.data_root, meta_csv)
     print(f'arch={a.arch}  type_loss={a.type_loss}  train={len(tr)}  val={len(va)}  val patients={meta.pid.iloc[va].nunique()}')
     print(f'[type] train: {int((tt.hard[tr] >= 0).sum())} hard, {int(((tt.tset[tr].sum(1) > 1)).sum())} partial, '
           f'{int((tt.bag[tr] >= 0).sum())} in {len(np.unique(tt.bag[tr][tt.bag[tr] >= 0]))} MIL bags; '
