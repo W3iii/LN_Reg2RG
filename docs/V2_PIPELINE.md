@@ -26,10 +26,15 @@ GT v2 lobe text:
 
 ## Model changes
 
-- `QueryLesionEncoder` (`lesion_arch=vitq`, `src/Model/my_embedding_layer.py`): conv stem to a
-  16×16×8 grid of the native 64×64×32 crop, 4 transformer layers, 3 learnable queries that
-  cross-attend to the patch tokens (Q = queries, K/V = patches) → 3 tokens per nodule.
-  ~7.3 M parameters.
+- `QueryLesionEncoder` (`lesion_arch=vitq`, `src/Model/my_embedding_layer.py`): the
+  PooledLesionEncoder conv trunk (16×16×8 grid of the native 64×64×32 crop), 2 transformer
+  layers, then 3 learnable queries that cross-attend to the grid (Q = queries, K/V = cells)
+  with a learned centre-distance penalty per query and head (init = the `center` Gaussian)
+  → 3 tokens per nodule. ~5.5 M parameters.
+  The first version (2026-11-17: plain ViT stem, 4 layers, no centre prior) did not learn on
+  the real data: after 14 epochs val size rho 0.13–0.19, RADS kappa 0, every type predicted
+  GGO, train loss flat. On a synthetic size task the current version reaches rho 0.99 in 50
+  steps, like `attn`.
 - Pretraining (`evaluation/train_lesion_encoder.py --arch vitq`): token 0 → size head,
   token 1 → type head (GGO / solid / part-solid / calcified), token 2 → RADS head. The heads
   are not part of the report model; only the encoder weights are loaded.

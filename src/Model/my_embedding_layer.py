@@ -1,3 +1,4 @@
+import math
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
@@ -137,19 +138,49 @@ class PooledLesionEncoder(nn.Module):
         return self.fc(torch.cat([loc, glob], 1))
 
 
-class QueryLesionEncoder(nn.Module):
-    """vitq: a small 3D ViT over the native-resolution crop, read out by learnable attribute queries.
+class CentredCrossAttention(nn.Module):
+    """Multi-head cross-attention from a few queries to the patch grid, with a learned
+    centre-distance penalty per (query, head): logits -= softplus(s) * d2, d2 = squared
+    distance of each cell from the crop centre (the nodule). Initialised to the Gaussian
+    (sigma = 2 cells) that the `center` pooling uses; a query can widen or sharpen it."""
 
-    One token per attribute query instead of one pooled vector:
+    def __init__(self, d, heads, n_queries, d2, sigma=2.0):
+        super().__init__()
+        self.h, self.dh = heads, d // heads
+        self.q, self.k, self.v, self.o = (nn.Linear(d, d) for _ in range(4))
+        self.register_buffer('d2', d2.flatten())                      # (S,)
+        init = math.log(math.expm1(1.0 / (2 * sigma ** 2)))          # softplus^-1(1 / 2 sigma^2)
+        self.dist = nn.Parameter(torch.full((n_queries, heads), init))
+
+    def forward(self, q, mem):
+        N, T, D = q.shape
+        S = mem.shape[1]
+        qh = self.q(q).view(N, T, self.h, self.dh).transpose(1, 2)    # (N, h, T, dh)
+        kh = self.k(mem).view(N, S, self.h, self.dh).transpose(1, 2)  # (N, h, S, dh)
+        vh = self.v(mem).view(N, S, self.h, self.dh).transpose(1, 2)
+        logits = (qh @ kh.transpose(-1, -2)).float() / math.sqrt(self.dh)
+        bias = F.softplus(self.dist).t().unsqueeze(-1) * self.d2.float()   # (h, T, S)
+        att = torch.softmax(logits - bias, -1).to(vh.dtype)
+        out = (att @ vh).transpose(1, 2).reshape(N, T, D)
+        return self.o(out)
+
+
+class QueryLesionEncoder(nn.Module):
+    """vitq: attribute queries over the lesion feature grid, one token per query.
 
         crop (1, 64, 64, 32) at native (0.8, 0.8, 1.0) mm
-        -> conv stem, two stride-2 stages -> 16x16x8 patch grid (3.2 x 3.2 x 4 mm per cell,
-           the same grid PooledLesionEncoder pools; a ~5 mm nodule spans 1-2 cells, not
-           0.117 of a RadFM patch)
-        -> `depth` pre-norm transformer layers with a learned 3D position embedding
-        -> `n_queries` learnable queries cross-attend to the patch tokens (queries = Q,
-           patch tokens = K/V) in `dec_depth` decoder layers
+        -> the PooledLesionEncoder conv trunk -> 16x16x8 grid (3.2 x 3.2 x 4 mm per cell)
+        -> linear to d_model + learned 3D position embedding
+        -> `depth` pre-norm transformer layers over the grid (context between cells)
+        -> `n_queries` learnable queries, `dec_depth` blocks of
+           [centre-biased cross-attention to the grid (CentredCrossAttention) + MLP]
         -> LayerNorm + Linear to the LLM width: (N, n_queries, dim)
+
+    Why not a plain ViT (the first vitq, 2026-11-17): trained from scratch on ~4k nodules
+    it never left the mean -- val size rho 0.13-0.19, kappa 0, every type GGO after 14
+    epochs -- because a ~5 mm nodule is a few of 2,048 cells and nothing told the queries
+    where it is. The conv trunk + centre prior are what got `center` / `attn` to rho
+    0.79 / 0.81; this keeps both and only changes the read-out to one token per query.
 
     Query order is fixed and the pretraining heads in evaluation/train_lesion_encoder.py
     sit on it: token 0 -> size, token 1 -> type, token 2 -> TW Lung-RADS. In the report
@@ -161,34 +192,48 @@ class QueryLesionEncoder(nn.Module):
     """
     QUERY_NAMES = ('size', 'type', 'rads')
 
-    def __init__(self, dim=4096, width=32, d_model=256, depth=4, heads=8, dec_depth=2,
-                 n_queries=3, grid=(16, 16, 8)):
+    def __init__(self, dim=4096, width=32, d_model=256, depth=2, heads=8, dec_depth=2,
+                 n_queries=3, grid=(16, 16, 8), sigma=2.0):
         super().__init__()
         self.n_tokens = n_queries
-        self.stem = nn.Sequential(_conv_block(1, width, 2), _conv_block(width, width * 2, 2),
-                                  _conv_block(width * 2, d_model, 1))
+        self.net = nn.Sequential(_conv_block(1, width, 2), _conv_block(width, width * 2, 2),
+                                 _conv_block(width * 2, width * 4, 1), _conv_block(width * 4, width * 4, 1))
         self.grid = tuple(grid)
+        self.proj = nn.Linear(width * 4, d_model)
         self.pos = nn.Parameter(torch.zeros(1, grid[0] * grid[1] * grid[2], d_model))
         nn.init.trunc_normal_(self.pos, std=0.02)
         enc = nn.TransformerEncoderLayer(d_model, heads, 4 * d_model, dropout=0.0, activation='gelu',
                                          batch_first=True, norm_first=True)
-        self.encoder = nn.TransformerEncoder(enc, depth, enable_nested_tensor=False)
+        self.encoder = nn.TransformerEncoder(enc, depth, enable_nested_tensor=False) if depth else nn.Identity()
+        self.mem_norm = nn.LayerNorm(d_model)
+
+        g = torch.stack(torch.meshgrid(*(torch.arange(float(n)) for n in grid), indexing='ij'))
+        centre = torch.tensor([(n - 1) / 2 for n in grid]).view(3, 1, 1, 1)
+        scale = torch.tensor([1., 1., 2.]).view(3, 1, 1, 1)          # z cells are 2x as thick
+        d2 = (((g - centre) * scale) ** 2).sum(0)
+
         self.queries = nn.Parameter(torch.zeros(1, n_queries, d_model))
         nn.init.trunc_normal_(self.queries, std=0.02)
-        dec = nn.TransformerDecoderLayer(d_model, heads, 4 * d_model, dropout=0.0, activation='gelu',
-                                         batch_first=True, norm_first=True)
-        self.decoder = nn.TransformerDecoder(dec, dec_depth)
+        self.cross = nn.ModuleList(CentredCrossAttention(d_model, heads, n_queries, d2, sigma)
+                                   for _ in range(dec_depth))
+        self.q_norm = nn.ModuleList(nn.LayerNorm(d_model) for _ in range(dec_depth))
+        self.mlp_norm = nn.ModuleList(nn.LayerNorm(d_model) for _ in range(dec_depth))
+        self.mlp = nn.ModuleList(nn.Sequential(nn.Linear(d_model, 4 * d_model), nn.GELU(),
+                                               nn.Linear(4 * d_model, d_model)) for _ in range(dec_depth))
         self.norm = nn.LayerNorm(d_model)
         self.fc = nn.Linear(d_model, dim)
 
     def forward(self, x):
         # x: (N, 1, 64, 64, 32) -> (N, n_queries, dim)
-        f = self.stem(x)                                     # (N, d_model, 16, 16, 8)
+        f = self.net(x)                                     # (N, 4*width, 16, 16, 8)
         if tuple(f.shape[2:]) != self.grid:
-            raise ValueError(f'patch grid {tuple(f.shape[2:])} != {self.grid}: crop size changed?')
-        t = f.flatten(2).transpose(1, 2) + self.pos.to(f.dtype)
-        t = self.encoder(t)
-        q = self.decoder(self.queries.to(t.dtype).expand(x.shape[0], -1, -1), t)
+            raise ValueError(f'feature grid {tuple(f.shape[2:])} != {self.grid}: crop size changed?')
+        t = self.proj(f.flatten(2).transpose(1, 2)) + self.pos.to(f.dtype)
+        mem = self.mem_norm(self.encoder(t))
+        q = self.queries.to(mem.dtype).expand(x.shape[0], -1, -1)
+        for att, qn, mn, mlp in zip(self.cross, self.q_norm, self.mlp_norm, self.mlp):
+            q = q + att(qn(q), mem)
+            q = q + mlp(mn(q))
         return self.fc(self.norm(q))
 
 
