@@ -447,7 +447,7 @@ class RadGenomeDataset_Train(PersistentDataset):
     def _finish_v2(self, img_file, instruction, region2area, slots_per_region, lesion_crops,
                    mask_img_tensors, mask_tensors, lesion_x, lesion_slots):
         volume = os.path.basename(img_file)
-        prompt, combined_report, spans, _ = build_v2_text(self, volume, instruction, region2area,
+        prompt, combined_report, spans, _, _ = build_v2_text(self, volume, instruction, region2area,
                                                           slots_per_region, lesion_crops)
         self.text_tokenizer.padding_side = "right"
         full = prompt + ' ' + combined_report

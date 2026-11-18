@@ -20,6 +20,11 @@ Per result file (one row each, sorted by the order given):
                    lower-cased whitespace tokens) for choosing a checkpoint; report paper
                    numbers with the standard evaluators.
 
+GT v3 results (an 'Impression:' section, [TYPE#..] filled from the type head) also get
+  imp BLEU-4 / ROUGE-L   on the Impression text (left out when 'impression' is in Masked_regions)
+  type fill             share of generated [TYPE#..] slots that got a type word (n_type_filled /
+                        n_type_slots); the per-type recall / precision then measure the filled words
+
 Lobes listed in Masked_regions (GT text describes a lesion with no mask, loss_mask = 0) are
 left out of every metric. The test set is not shuffled, so lobe naming is not scored here.
 """
@@ -42,8 +47,14 @@ NODULE = re.compile(r'nodul|GGN|GGO|ground[\s-]?glass|opacit|mass\b|lesion|calci
 IDX = re.compile(r'\[SIZE#(\d+)\]')
 
 
+def split_imp(report):
+    t = str(report) if isinstance(report, str) else ''
+    i = t.find('Impression:')
+    return (t, None) if i < 0 else (t[:i], t[i + len('Impression:'):].strip())
+
+
 def split(report):
-    parts = _SPLIT.split(str(report) if isinstance(report, str) else '')
+    parts = _SPLIT.split(split_imp(report)[0])
     return {parts[i]: parts[i + 1].strip() for i in range(1, len(parts) - 1, 2)}
 
 
@@ -105,6 +116,7 @@ def score(path):
     c = Counter()
     ty = Counter()
     refs, hyps, rl = [], [], []
+    irefs, ihyps, irl = [], [], []
     for r in d.itertuples():
         masked = set(json.loads(r.Masked_regions)) if isinstance(r.Masked_regions, str) else set()
         g, p = split(r.GT_combined_report), split(r.Pred_combined_report)
@@ -126,6 +138,10 @@ def score(path):
                 ty[(t, 'gt')] += t in gt_t; ty[(t, 'pr')] += t in pr_t; ty[(t, 'tp')] += t in gt_t and t in pr_t
             rt, ht = toks(gt), toks(pr)
             refs.append(rt); hyps.append(ht); rl.append(rouge_l(rt, ht))
+        gi, pi = split_imp(r.GT_combined_report)[1], split_imp(r.Pred_combined_report)[1]
+        if gi is not None and 'impression' not in masked:
+            rt, ht = toks(gi), toks(pi or '')
+            irefs.append(rt); ihyps.append(ht); irl.append(rouge_l(rt, ht))
     P, R, F = prf(c['tp'], c['fp'], c['fn'])
     kP, kR, _ = prf(c['k_tp'], c['k_fp'], c['k_fn'])
     out = dict(n=len(d), lobes=c['lobes'], find_P=P, find_R=R, find_F1=F,
@@ -133,7 +149,10 @@ def score(path):
                normal_pred=c['pr_normal'] / c['lobes'], normal_gt=c['gt_normal'] / c['lobes'],
                k_P=kP, k_R=kR,
                unfilled=d['n_unfilled'].sum() / max(d['n_size_slots'].sum(), 1) if 'n_unfilled' in d else float('nan'),
-               BLEU4=bleu4(refs, hyps), ROUGE_L=sum(rl) / max(len(rl), 1))
+               BLEU4=bleu4(refs, hyps), ROUGE_L=sum(rl) / max(len(rl), 1),
+               imp_n=len(irl), imp_BLEU4=bleu4(irefs, ihyps) if irl else float('nan'),
+               imp_ROUGE_L=sum(irl) / len(irl) if irl else float('nan'),
+               type_fill=(d['n_type_filled'].sum() / max(d['n_type_slots'].sum(), 1)) if 'n_type_slots' in d else float('nan'))
     for t in TYPES:
         out[f'{t}_R'] = ty[(t, 'tp')] / ty[(t, 'gt')] if ty[(t, 'gt')] else float('nan')
         out[f'{t}_P'] = ty[(t, 'tp')] / ty[(t, 'pr')] if ty[(t, 'pr')] else float('nan')
@@ -155,8 +174,8 @@ def main(args):
     pd.set_option('display.width', 220)
     pd.set_option('display.max_columns', 50)
     main_cols = ['n', 'lobes', 'find_P', 'find_R', 'find_F1', 'nod_R', 'normal_pred', 'normal_gt',
-                 'k_P', 'k_R', 'unfilled', 'BLEU4', 'ROUGE_L']
-    print(df[main_cols].round(3).to_string())
+                 'k_P', 'k_R', 'unfilled', 'BLEU4', 'ROUGE_L', 'imp_n', 'imp_BLEU4', 'imp_ROUGE_L', 'type_fill']
+    print(df[[c for c in main_cols if df[c].notna().any()]].round(3).to_string())
     print()
     tcols = [f'{t}_{s}' for t in TYPES for s in ('R', 'P')]
     print('type named in lobe (recall / precision); GT lobes per type:',

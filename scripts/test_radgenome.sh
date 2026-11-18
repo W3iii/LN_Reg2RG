@@ -35,4 +35,6 @@ CUDA_VISIBLE_DEVICES=$cuda_devices python ../src/${script_name}.py \
     --size_placeholder "$size_placeholder" \
     --lesion_type "$lesion_type" \
     --lesion_type_min_conf "$lesion_type_min_conf" \
+    --type_fill_csv "${type_fill_csv:-}" \
+    --type_fill_min_conf "${type_fill_min_conf:-0.6}" \
     --result_path "$result_path"

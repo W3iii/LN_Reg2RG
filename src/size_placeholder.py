@@ -161,3 +161,95 @@ def fill_report_v2(report, sizes_by_slot):
         n_ph += ph; n_unf += unf
         out.append(f'The region {slot} is ' + body)
     return ''.join(out), n_ph, n_unf
+
+
+# ---------------------------------------------------------------- v3 (types + Impression)
+# GT v3 (region_report_v3_*.csv) adds
+#   [TYPE#<nodule_id>=<word>]  the density word of a one-nodule piece (ground-glass / solid /
+#                              part-solid / subsolid / calcified ...). The target shows only the
+#                              index; the word is kept so the GT side of evaluation can be rebuilt.
+#   an 'impression' row        appended after the lobes as 'Impression: ...'. It may mention nodules
+#                              of any lobe, so there the index carries the region slot too:
+#                              [SIZE#i.k] / [TYPE#i.k] = region i's k-th nodule.
+# At inference [TYPE#..] is filled from the lesion encoder's type head when its confidence reaches
+# a threshold and is deleted otherwise ('a [TYPE#1] nodule' -> 'a nodule').
+TAG = re.compile(r'\[(SIZE|TYPE)#(\d+)(?:=([^\]]*))?\]')
+TYPE_WORD = {'GGO': 'ground-glass', 'solid': 'solid', 'part-solid': 'part-solid', 'calcified': 'calcified'}
+_IMPRESSION = 'Impression: '
+
+
+def localize_ids(text, where, keep_word=False):
+    """Rewrite dataset-wide ids. where: nodule_id -> local label ('2' in a lobe, '3.2' in the
+    Impression). Unknown id: SIZE -> [SIZE], TYPE -> removed (nothing can fill it).
+    keep_word: TYPE -> its GT word instead of a tag (the GT text for evaluation)."""
+    def sub(m):
+        kind, nid, word = m.group(1), int(m.group(2)), m.group(3)
+        if kind == 'TYPE' and keep_word:
+            return word or ''
+        if nid in where:
+            return f'[{kind}#{where[nid]}]'
+        return PLACEHOLDER if kind == 'SIZE' else ''
+    out = TAG.sub(sub, text)
+    return tidy_text(out) if 'TYPE#' in text else out      # v2 text (no TYPE tags) stays byte-identical
+
+
+def tidy_text(t):
+    t = re.sub(r'\s{2,}', ' ', t)
+    t = re.sub(r'\s+([,.;)])', r'\1', t)
+    t = re.sub(r'\b([Aa]) (?=[aeiouAEIOU])', lambda m: m.group(1) + 'n ', t)        # a ground-glass / an opacity
+    t = re.sub(r'\b([Aa])n (?=[b-df-hj-np-tv-zB-DF-HJ-NP-TV-Z])', lambda m: m.group(1) + ' ', t)
+    return t.strip()
+
+
+_SEG = re.compile(r'(The region \d+ is |Impression: )')
+
+
+def fill_report_v3(report, sizes_by_slot, types_by_slot=None, min_conf=0.6):
+    """Fill a generated v2/v3 report.
+    sizes_by_slot: region slot -> eq. diameters (mm), lesion-slot order
+    types_by_slot: region slot -> [(type name, confidence)], same order; None -> every [TYPE..] removed
+    Returns (text, stats) with stats = size_slots, size_unfilled, type_slots, type_filled."""
+    st = dict(size_slots=0, size_unfilled=0, type_slots=0, type_filled=0)
+    allsz = sorted((v for vs in sizes_by_slot.values() for v in vs), reverse=True)
+
+    def lookup(table, ref, slot):
+        i, k = (int(x) for x in ref.split('.')) if '.' in ref else (slot, int(ref))
+        vs = (table or {}).get(i, [])
+        return vs[k - 1] if i is not None and 1 <= k <= len(vs) else None
+
+    def fill_body(body, slot):
+        st['size_slots'] += body.count(PLACEHOLDER)          # bare ones; indexed ones counted below
+        res, last = [], 0
+        for m in re.finditer(r'\[(SIZE|TYPE)#([\d.]+)\]|\[SIZE\]', body):
+            res.append(body[last:m.start()]); last = m.end()
+            if m.group(0) == PLACEHOLDER:
+                res.append(m.group(0)); continue
+            kind, ref = m.group(1), m.group(2)
+            if kind == 'SIZE':
+                st['size_slots'] += 1
+                v = lookup(sizes_by_slot, ref, slot)
+                res.append(format_size(v) if v is not None else PLACEHOLDER)
+            else:
+                st['type_slots'] += 1
+                v = lookup(types_by_slot, ref, slot)
+                if v is not None and v[1] >= min_conf and v[0] in TYPE_WORD:
+                    res.append(TYPE_WORD[v[0]]); st['type_filled'] += 1
+                else:
+                    res.append('')
+        res.append(body[last:])
+        body = ''.join(res)
+        own = sorted(sizes_by_slot.get(slot, []), reverse=True) if slot is not None else allsz
+        body, unf = fill_sizes(body, own)
+        st['size_unfilled'] += unf
+        return tidy_text(body)
+
+    parts = _SEG.split(report)
+    out = [parts[0]]
+    for j in range(1, len(parts) - 1, 2):
+        head, body = parts[j], parts[j + 1]
+        m = re.match(r'The region (\d+) is ', head)
+        slot = int(m.group(1)) if m else None
+        out.append(head + fill_body(body, slot) + ' ')
+    if len(parts) == 1:
+        out = [fill_body(report, None)]
+    return ''.join(out).strip(), st

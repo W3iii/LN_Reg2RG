@@ -98,3 +98,36 @@ cached per CSV name; the v2 names are new, so stale lists are only a risk for th
 - train_lesion_encoder.py `--arch vitq --meta nodule_metadata_v2.csv` end to end on a mini set
 - v2 type labels: train 1,147 hard / 56 partial / 338 in MIL bags (C/X-tier sentences and
   loss-masked lobes are not used)
+
+## GT v3 (2026-11-19): Findings per lobe + Impression, size and type placeholders
+
+`data_prep/ncku_v2/matching_v2/build_gt_v3.py` -> `region_report_v3_{train,val,test_me,test_ldct}.csv`
+(same columns). The matching is unchanged (match_v2.py now also keeps each merged piece's Findings
+and Impression wording apart: `text_f` / `text_i`, plus `<ds>_sentences_v2.csv`).
+
+- lobe rows: only the Findings wording of the lobe's lesion pieces (v2 repeated every nodule in
+  Findings and Impression wording)
+- `impression` row: the report's Impression in order -- lung-lesion pieces in their Impression
+  wording plus recommendations / judgements ("Suggest follow up.", "Probably benign.");
+  extrapulmonary and comparison-only sentences go to the ignored global row. loss_mask 0 when it
+  describes a lung lesion without a mask (231 / 1,093 train).
+- `[TYPE#<nodule_id>=<word>]`: density words (GGN / GGO / ground-glass / part-solid / subsolid /
+  non-solid / solid / calcified) of pieces given to exactly one nodule -- the same pieces that
+  get `[SIZE#..]` (3,038 tags). The word stays in the CSV only to rebuild the GT for evaluation.
+
+Dataset (detected from the CSV): target = lobes + `Impression: ...`; lobe tags become `[SIZE#k]` /
+`[TYPE#k]`, Impression tags `[SIZE#i.k]` / `[TYPE#i.k]` (region slot i of this prompt, k-th
+nodule); the instruction gains " Finally, write an impression for the whole scan."
+Without lesion tokens, size tags become `[SIZE]` and type tags are removed. Max 864 tokens.
+
+Inference: `evaluation/predict_types_v2.py` writes per-nodule type + confidence from the frozen
+encoder's type head; `fill_report_v3` writes the type word when confidence >= type_fill_min_conf
+(default 0.6) and deletes the tag otherwise ("a [TYPE#1] nodule" -> "a nodule").
+
+```bash
+cd scripts && seed=42 bash train_radgenome.sh ncku_a100_v3          # Reg2RG_v3_vitq
+cd .. && python evaluation/predict_types_v2.py --ckpt outputs/lesion_enc_vitq_ce_mil_v2_seed0/best.pt \
+    --meta $DATA_ROOT/nodule_metadata_v2.csv --data_root $DATA_ROOT --out outputs/type_pred_vitq_v2.csv
+cd scripts && split=val ckpt_step=1360 bash test_radgenome.sh ncku_a100_v3
+cd .. && python evaluation/eval_v2.py results/Reg2RG_v3_vitq_seed42_val_ckpt*_v3.csv   # + imp BLEU/ROUGE, type fill
+```

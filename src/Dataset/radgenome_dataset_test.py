@@ -18,14 +18,15 @@ import pickle
 
 from regions import REGIONS, MAX_LESION_PER_REGION, lesion_token_names
 from lesion_utils import load_nodule_index, load_nodule_boxes, crop_lesion, normalize_lesion, lesion_token_text
-from size_placeholder import fill_report_v2
+from size_placeholder import fill_report_v2, fill_report_v3
 from Dataset.report_v2 import is_v2_csv, load_v2_reports, lobe_nodules, build_v2_text
 
 class RadGenomeDataset_Test(PersistentDataset):
     # See the note in radgenome_dataset_train.py: nodule_metadata=None means
     # lesion tokens are off, and inference must be run with the same setting the
     # checkpoint was trained under.
-    def __init__(self, text_tokenizer, data_folder, mask_folder, csv_file, cache_dir, inferenced_id, max_region_size=5, max_img_size = 1, image_num = 32, region_num=33, max_seq=2048, resize_dim=500, voc_size=32000, force_num_frames=True, nodule_metadata=None, lesion_pred_csv=None, lesion_order='truth', lesion_size_unit='mm', lesion_type=False, lesion_type_min_conf=0.0, lesion_tokens_per_nodule=1):
+    def __init__(self, text_tokenizer, data_folder, mask_folder, csv_file, cache_dir, inferenced_id, max_region_size=5, max_img_size = 1, image_num = 32, region_num=33, max_seq=2048, resize_dim=500, voc_size=32000, force_num_frames=True, nodule_metadata=None, lesion_pred_csv=None, lesion_order='truth', lesion_size_unit='mm', lesion_type=False, lesion_type_min_conf=0.0, lesion_tokens_per_nodule=1,
+                 type_fill_csv=''):
         self.inferenced_id = inferenced_id
         # text_tokenizer
         self.text_tokenizer = AutoTokenizer.from_pretrained(
@@ -78,6 +79,8 @@ class RadGenomeDataset_Test(PersistentDataset):
         self.max_region_size = max_region_size
         # GT v2 / split C: see radgenome_dataset_train.py and Dataset/report_v2.py
         self.v2 = is_v2_csv(csv_file)
+        self.v3 = False
+        self.type_preds = {}
         self.nodule_boxes = None
         if self.v2:
             if lesion_pred_csv or lesion_type:
@@ -85,8 +88,16 @@ class RadGenomeDataset_Test(PersistentDataset):
             self.reports_v2 = load_v2_reports(csv_file)
             self.nodule_boxes = load_nodule_boxes(nodule_metadata) if nodule_metadata else None
             nodule_metadata = None
-            print(f'[dataset] v2 reports: {csv_file}; lesion tokens '
-                  + (f'ON ({self.n_tok} token(s) per nodule)' if self.nodule_boxes else 'OFF'))
+            self.v3 = any('impression' in r for r in self.reports_v2.values())
+            # v3: per-nodule type predictions (evaluation/predict_types_v2.py) fill [TYPE#..]
+            self.type_preds = {}
+            if type_fill_csv:
+                tp = pd.read_csv(type_fill_csv)
+                self.type_preds = {(str(r.Volumename), int(r.nodule_id)): (str(r.pred_type), float(r.pred_conf))
+                                   for r in tp.itertuples()}
+            print(f'[dataset] v2 reports: {csv_file}' + (' (v3: Impression + [TYPE#k])' if self.v3 else '')
+                  + '; lesion tokens ' + (f'ON ({self.n_tok} token(s) per nodule)' if self.nodule_boxes else 'OFF')
+                  + (f'; type predictions for {len(self.type_preds)} nodules' if self.type_preds else ''))
         self.nodule_index = (
             load_nodule_index(nodule_metadata, MAX_LESION_PER_REGION,
                               pred_csv=lesion_pred_csv, order=lesion_order, with_type=lesion_type,
@@ -393,12 +404,19 @@ class RadGenomeDataset_Test(PersistentDataset):
         """v2 sample: the prompt as in training (no shuffle here), the placeholder GT, the GT filled
         from the masks, and what inference needs to fill the prediction the same way."""
         volume = os.path.basename(img_file)
-        prompt, combined_report, _, sizes = build_v2_text(self, volume, instruction, region2area,
-                                                          slots_per_region, lesion_crops)
-        gt_filled = fill_report_v2(combined_report, sizes)[0] if sizes else combined_report
+        prompt, combined_report, _, sizes, gt_report = build_v2_text(self, volume, instruction, region2area,
+                                                                     slots_per_region, lesion_crops)
+        if self.v3:
+            gt_filled = fill_report_v3(gt_report, sizes)[0]
+        else:
+            gt_filled = fill_report_v2(combined_report, sizes)[0] if sizes else combined_report
         rep = self.reports_v2.get(volume, {})
         masked = [region2area[i] for i in range(len(region2area))
                   if rep.get(region2area[i], {}).get('loss_mask', 1) == 0]
+        if rep.get('impression', {}).get('loss_mask', 1) == 0:
+            masked.append('impression')
+        types = {i: [self.type_preds.get((volume, n), ('', 0.0)) for _, n, _ in lesion_crops.get(region2area[i], [])]
+                 for i in range(len(region2area))}
         text_input = self.text_tokenizer(prompt, max_length=self.max_seq, truncation=True,
                                          return_tensors="pt")["input_ids"][0]
         return {'acc_num': self.data[index]['accnum'],
@@ -412,5 +430,7 @@ class RadGenomeDataset_Test(PersistentDataset):
                 'gt_combined_report': combined_report,
                 'gt_filled_report': gt_filled,
                 'sizes_by_slot': sizes,
+                'types_by_slot': types,
                 'masked_regions': masked,
+                'gt_raw_report_v3': gt_report,
                 }

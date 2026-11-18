@@ -215,6 +215,7 @@ def match_patient(nods, sents):
                     f, i = fs[a], im[b]
                     same = f['text'].strip().lower() == i['text'].strip().lower()   # Findings 與 Impression 一字不差 -> 只留一次
                     merged.append(dict(f, text=f['text'] if same else f['text'] + ' ' + i['text'], orig=f['orig'] + ' ' + i['orig'],
+                                       text_f=f['text'], text_i=i['text'],     # kept apart for GT v3 (Findings / Impression)
                                        section='both', sizes=f['sizes'] + i['sizes'],
                                        upto=f['upto'] or i['upto'], rewritten=f['rewritten'] or i['rewritten']))
                     used_i.add(b); fs[a] = None
@@ -246,8 +247,11 @@ def match_patient(nods, sents):
 
 def run(dataset, patients):
     """patients: list of (key, nods, sents)"""
-    rows, rep_lesion, pieces = [], [], []
+    rows, rep_lesion, pieces, sent_rows = [], [], [], []
     for key, nods, sents in patients:
+        for k, s in enumerate(sents):                           # every cleaned sentence with its section (GT v3)
+            sent_rows.append(dict(key=key, idx=k, section=s['section'], text=s['text'],
+                                  is_lung_lesion=bool(s.get('is_lung_lesion')), lobes=','.join(s.get('lobes') or [])))
         asg, cands = match_patient(nods, sents)
         for i, n in enumerate(nods):
             a = asg.get(i); c = cands[a[0]] if a else None
@@ -265,7 +269,9 @@ def run(dataset, patients):
                                lobes=','.join(c['lobes']), sides=','.join(sorted(c['sides'])),
                                sizes=';'.join(f'{v:g}' for v in c['sizes']), upto=c['upto'],
                                nodule_like=bool(re.search(NODULE_LIKE, c['text'], re.I)),
-                               assigned=','.join(str(n) for n in sorted(by_cand.get(j, []))), text=c['text'], orig=c['orig']))
+                               assigned=','.join(str(n) for n in sorted(by_cand.get(j, []))), text=c['text'], orig=c['orig'],
+                               text_f=c.get('text_f', c['text'] if c['section'] == 'findings' else ''),
+                               text_i=c.get('text_i', c['text'] if c['section'] == 'impression' else '')))
         used = {a[0] for a in asg.values()}
         for j, c in enumerate(cands):
             if j in used or c['kind'] == 'shared': continue
@@ -275,6 +281,7 @@ def run(dataset, patients):
     R = pd.DataFrame(rows); U = pd.DataFrame(rep_lesion)
     R.to_csv(os.path.join(HERE, f'{dataset}_nodule_sentence_v2.csv'), index=False, encoding='utf-8-sig')
     pd.DataFrame(pieces).to_csv(os.path.join(HERE, f'{dataset}_pieces_v2.csv'), index=False, encoding='utf-8-sig')
+    pd.DataFrame(sent_rows).to_csv(os.path.join(HERE, f'{dataset}_sentences_v2.csv'), index=False, encoding='utf-8-sig')
     U.to_csv(os.path.join(HERE, f'{dataset}_report_lesion_without_mask.csv'), index=False, encoding='utf-8-sig')
     return R, U
 

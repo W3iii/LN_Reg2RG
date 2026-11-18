@@ -6,7 +6,7 @@ import transformers
 from dataclasses import dataclass, field
 from Model.Reg2RG import Reg2RG
 from Dataset.radgenome_dataset_test import RadGenomeDataset_Test
-from Dataset.report_v2 import is_v2_csv
+from Dataset.report_v2 import is_v2_csv, is_v3_csv
 # from args.test_combined_region_radgenome.superpod import ModelArguments, DataArguments
 from args.test_radgenome.jhcpu7 import ModelArguments, DataArguments
 import torch
@@ -19,7 +19,7 @@ import pandas as pd
 
 import json
 from regions import REGIONS, tokens_per_lesion
-from size_placeholder import fill_report, fill_report_v2
+from size_placeholder import fill_report, fill_report_v2, fill_report_v3
 
 @dataclass
 class DataCollator(object):
@@ -29,7 +29,7 @@ class DataCollator(object):
         acc_nums, lang_xs, vision_xs, mask_xs, region2areas, lesion_xs, lesion_slots_list, questions, gt_combined_reports = tuple([instance[key] for instance in instances] for key in ('acc_num', 'lang_x','vision_x', 'mask_x', 'region2area', 'lesion_x', 'lesion_slots', 'question', 'gt_combined_report'))
         # v2 extras (GT filled from masks, sizes for filling the prediction, loss-masked lobes)
         extras = {k: [instance[k] for instance in instances]
-                  for k in ('gt_filled_report', 'sizes_by_slot', 'masked_regions') if k in instances[0]}
+                  for k in ('gt_filled_report', 'sizes_by_slot', 'types_by_slot', 'masked_regions') if k in instances[0]}
 
         lang_xs = torch.cat([_.unsqueeze(0) for _ in lang_xs], dim = 0)
 
@@ -118,12 +118,17 @@ def main():
     
     # 判断结果保存路径是否存在，不存在则创建
     v2 = is_v2_csv(data_args.report_file)
+    v3 = is_v3_csv(data_args.report_file)
     columns = ["AccNum", "Question", "GT_combined_report", "Pred_combined_report"]
     if v2:
         # GT_combined_report / Pred_combined_report are filled with mask sizes (what evaluation
         # reads); the raw [SIZE#k] texts are kept beside them. Masked_regions: lobes whose GT
         # text describes a lesion with no mask (loss_mask = 0) -- exclude them from scoring.
         columns += ["GT_raw_report", "Pred_raw_report", "n_size_slots", "n_unfilled", "Masked_regions"]
+        if v3:
+            # GT v3: 'Impression: ...' after the lobes; [TYPE#..] filled from type_fill_csv when the
+            # encoder's confidence reaches type_fill_min_conf, removed otherwise
+            columns += ["n_type_slots", "n_type_filled"]
     elif data_args.size_placeholder:
         # Pred_combined_report is the filled report (what every evaluation reads);
         # the raw generation with its [SIZE] slots is kept beside it.
@@ -157,6 +162,7 @@ def main():
         lesion_type=data_args.lesion_type,
         lesion_type_min_conf=data_args.lesion_type_min_conf,
         lesion_tokens_per_nodule=tokens_per_lesion(model_args.lesion_arch),
+        type_fill_csv=data_args.type_fill_csv,
     )
 
     Test_dataloader = DataLoader(
@@ -210,7 +216,15 @@ def main():
         
         # 将数据添加到DataFrame中并保存到CSV文件
         row = [acc_num, question, gt_combined_report, pred_combined_report]
-        if v2:
+        if v3:
+            filled, st = fill_report_v3(pred_combined_report, sample["sizes_by_slot"][0],
+                                        sample["types_by_slot"][0] if Test_dataset.type_preds else None,
+                                        data_args.type_fill_min_conf)
+            print('Pred_filled: ', filled, f'({st})')
+            row = [acc_num, question, sample["gt_filled_report"][0], filled, gt_combined_report,
+                   pred_combined_report, st['size_slots'], st['size_unfilled'], json.dumps(sample["masked_regions"][0]),
+                   st['type_slots'], st['type_filled']]
+        elif v2:
             sizes = sample["sizes_by_slot"][0]
             filled, n_slots, n_unfilled = fill_report_v2(pred_combined_report, sizes)
             print('Pred_filled: ', filled, f'({n_slots} size slots, {n_unfilled} unfilled)')

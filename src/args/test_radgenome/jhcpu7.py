@@ -43,4 +43,8 @@ class DataArguments:
     lesion_type: bool = field(default=False)
     # B3g: write the type only when the encoder's confidence reaches this (0 = always, B3f)
     lesion_type_min_conf: float = field(default=0.0)
+    # GT v3: per-nodule type predictions (evaluation/predict_types_v2.py) that fill [TYPE#..] in the
+    # generated report; a type is written only when its confidence reaches type_fill_min_conf
+    type_fill_csv: Optional[str] = field(default='')
+    type_fill_min_conf: float = field(default=0.6)
     result_path: Optional[str] = field(default='/home/chenzhixuan/Workspace/Reg2RG/results/radgenome_combined_reports.csv')
