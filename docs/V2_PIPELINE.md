@@ -35,6 +35,10 @@ GT v2 lobe text:
   the real data: after 14 epochs val size rho 0.13–0.19, RADS kappa 0, every type predicted
   GGO, train loss flat. On a synthetic size task the current version reaches rho 0.99 in 50
   steps, like `attn`.
+  First v2 pretraining (2026-11-18, val): attn rho 0.771 / kappa 0.635 / type bacc 0.481;
+  vitq rho 0.659 / kappa 0.660 / type bacc 0.246 (type token collapsed to GGO). The queries
+  now self-attend before reading the grid, so the type token can use what size / RADS learn.
+  part-solid is 0 for both encoders (very few labels).
 - Pretraining (`evaluation/train_lesion_encoder.py --arch vitq`): token 0 → size head,
   token 1 → type head (GGO / solid / part-solid / calcified), token 2 → RADS head. The heads
   are not part of the report model; only the encoder weights are loaded.

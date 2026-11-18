@@ -173,7 +173,8 @@ class QueryLesionEncoder(nn.Module):
         -> linear to d_model + learned 3D position embedding
         -> `depth` pre-norm transformer layers over the grid (context between cells)
         -> `n_queries` learnable queries, `dec_depth` blocks of
-           [centre-biased cross-attention to the grid (CentredCrossAttention) + MLP]
+           [self-attention among the queries + centre-biased cross-attention to the
+            grid (CentredCrossAttention) + MLP]
         -> LayerNorm + Linear to the LLM width: (N, n_queries, dim)
 
     Why not a plain ViT (the first vitq, 2026-11-17): trained from scratch on ~4k nodules
@@ -181,6 +182,12 @@ class QueryLesionEncoder(nn.Module):
     epochs -- because a ~5 mm nodule is a few of 2,048 cells and nothing told the queries
     where it is. The conv trunk + centre prior are what got `center` / `attn` to rho
     0.79 / 0.81; this keeps both and only changes the read-out to one token per query.
+
+    Query self-attention (2026-11-18): without it the type query only ever saw the type
+    loss -- labels for 1,147 of 4,087 train nodules -- and collapsed to GGO (val type bacc
+    0.25, while the RADS query reached kappa 0.66 on the same grid). Letting the queries
+    read each other gives the type token what size / RADS learned, as the single shared
+    token of `attn` does (type bacc 0.48), and stays a standard DETR-style decoder block.
 
     Query order is fixed and the pretraining heads in evaluation/train_lesion_encoder.py
     sit on it: token 0 -> size, token 1 -> type, token 2 -> TW Lung-RADS. In the report
@@ -214,6 +221,9 @@ class QueryLesionEncoder(nn.Module):
 
         self.queries = nn.Parameter(torch.zeros(1, n_queries, d_model))
         nn.init.trunc_normal_(self.queries, std=0.02)
+        self.sa_norm = nn.ModuleList(nn.LayerNorm(d_model) for _ in range(dec_depth))
+        self.self_attn = nn.ModuleList(nn.MultiheadAttention(d_model, heads, batch_first=True)
+                                       for _ in range(dec_depth))
         self.cross = nn.ModuleList(CentredCrossAttention(d_model, heads, n_queries, d2, sigma)
                                    for _ in range(dec_depth))
         self.q_norm = nn.ModuleList(nn.LayerNorm(d_model) for _ in range(dec_depth))
@@ -231,7 +241,10 @@ class QueryLesionEncoder(nn.Module):
         t = self.proj(f.flatten(2).transpose(1, 2)) + self.pos.to(f.dtype)
         mem = self.mem_norm(self.encoder(t))
         q = self.queries.to(mem.dtype).expand(x.shape[0], -1, -1)
-        for att, qn, mn, mlp in zip(self.cross, self.q_norm, self.mlp_norm, self.mlp):
+        for sa, sn, att, qn, mn, mlp in zip(self.self_attn, self.sa_norm, self.cross, self.q_norm,
+                                            self.mlp_norm, self.mlp):
+            h = sn(q)
+            q = q + sa(h, h, h, need_weights=False)[0]
             q = q + att(qn(q), mem)
             q = q + mlp(mn(q))
         return self.fc(self.norm(q))
