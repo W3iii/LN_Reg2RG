@@ -27,6 +27,10 @@ This script tests both fixes before paying for another 4.5 h LLM run:
 gap/center/attn emit one 4096-d token and all heads sit on it; vitq emits three and each
 head sits on its own token. Either way the heads read exactly what the LLM would receive.
 
+Extra training crops (--extra_train, e.g. LIDC-IDRI from data_prep/lidc/build_lidc_lesions.py):
+appended to the training set only, with size and type labels and no RADS label (its loss is
+masked for those rows). Validation and model selection stay on ME val.
+
 Data (split C, 2026-11): --meta $DATA_ROOT/nodule_metadata_v2.csv. Only train / val rows with
 a TW_Lung_RADS grade are cached, i.e. ME only; LDCT is test_ldct and never read here. The
 crop cache and the type labels are named after the metadata file, so the old-split cache
@@ -182,6 +186,17 @@ class TypeTargets:
                     v[idx[n]] = 1
                 masks.append(v)
             self.ments[int(b)] = masks
+
+    def append_sets(self, sets):
+        """Extra rows (e.g. LIDC) with their own type sets ('GGO|part-solid', ...), no MIL bag."""
+        idx = {n: i for i, n in enumerate(TYPES)}
+        ts = np.zeros((len(sets), N_TYPES), dtype=np.float32)
+        for r, s in enumerate(sets):
+            for n in filter(None, str(s).split('|')):
+                ts[r, idx[n]] = 1
+        self.tset = np.concatenate([self.tset, ts])
+        self.hard = np.where(self.tset.sum(1) == 1, self.tset.argmax(1), -1).astype(np.int64)
+        self.bag = np.concatenate([self.bag, np.full(len(sets), -1, dtype=self.bag.dtype)])
 
     def class_weights(self, idx):
         """1/sqrt(freq) over the hard labels in idx, normalised to mean 1 over them."""
@@ -358,7 +373,9 @@ class Objective:
         self.a, self.tt, self.device, self.model = a, tt, device, model
         if a.concept != 'none' and model is None:
             raise ValueError('--concept needs the model (for its g)')
-        self.cw_rads = torch.tensor(len(idx) / (4 * np.bincount(rads_train, minlength=4).clip(1)), dtype=torch.float32, device=device)
+        rt = np.asarray(rads_train)
+        rt = rt[rt >= 0]                         # extra rows (--extra_train) carry no RADS label
+        self.cw_rads = torch.tensor(len(rt) / (4 * np.bincount(rt, minlength=4).clip(1)), dtype=torch.float32, device=device)
         self.cw_type = torch.tensor(tt.class_weights(idx), device=device)
         self.tset = torch.tensor(tt.tset, device=device)
         self.bag = torch.tensor(tt.bag, device=device)
@@ -366,8 +383,10 @@ class Objective:
     def __call__(self, out, ld, r, rows, epoch):
         s, rl, tl, _ = out
         a = self.a
+        has_r = r >= 0
         parts = {'size': F.smooth_l1_loss(s.float(), ld, beta=0.1),
-                 'rads': F.cross_entropy(rl.float(), r, weight=self.cw_rads)}
+                 'rads': (F.cross_entropy(rl.float()[has_r], r[has_r], weight=self.cw_rads) if has_r.any()
+                          else rl.float().sum() * 0.0)}
         loss = parts['size'] + a.w_rads * parts['rads']
         if a.type_loss in ('ce', 'ce_mil'):
             parts['type'] = type_loss(tl, self.tset[rows], self.cw_type)
@@ -553,6 +572,8 @@ def main():
     ap.add_argument('--meta', default=None, help='nodule metadata csv (default <data_root>/nodule_metadata.csv; '
                     'split C: <data_root>/nodule_metadata_v2.csv)')
     ap.add_argument('--cache', default=None, help='crop cache .npy (default named after --meta)')
+    ap.add_argument('--extra_train', default=None, help='extra training crops .npy with labels in <npy>.csv '
+                    '(Volumename, nodule_id, eq_diam_mm, type_set), e.g. LIDC; no RADS, train only')
     ap.add_argument('--epochs', type=int, default=40)
     ap.add_argument('--bs', type=int, default=64)
     ap.add_argument('--lr', type=float, default=3e-4)
@@ -579,6 +600,20 @@ def main():
     tr = np.flatnonzero(meta['split'].to_numpy() == 'train')
     va = np.flatnonzero(meta['split'].to_numpy() == 'val')
     tt = TypeTargets(meta, a.type_csv, a.data_root, meta_csv)
+    if a.extra_train:
+        if a.concept != 'none':
+            raise SystemExit('--extra_train rows have no RADS label; use --concept none')
+        ex = pd.read_csv(a.extra_train + '.csv', keep_default_na=False, na_values={'eq_diam_mm': ['']})
+        Xe = np.load(a.extra_train, mmap_mode='r')
+        if len(ex) != len(Xe):
+            raise SystemExit(f'{a.extra_train}: {len(Xe)} crops but {len(ex)} label rows')
+        n0 = len(X)
+        X = np.concatenate([np.asarray(X), np.asarray(Xe).astype(np.float16)])
+        logd = np.concatenate([logd, np.log(ex['eq_diam_mm'].to_numpy(np.float32))])
+        rads = np.concatenate([rads, np.full(len(ex), -100, dtype=np.int64)])
+        tr = np.concatenate([tr, n0 + np.arange(len(ex))])
+        tt.append_sets(ex['type_set'].tolist())
+        print(f'[extra] {a.extra_train}: +{len(ex)} training crops; type sets {ex.type_set.value_counts().to_dict()}')
     print(f'arch={a.arch}  type_loss={a.type_loss}  train={len(tr)}  val={len(va)}  val patients={meta.pid.iloc[va].nunique()}')
     print(f'[type] train: {int((tt.hard[tr] >= 0).sum())} hard, {int(((tt.tset[tr].sum(1) > 1)).sum())} partial, '
           f'{int((tt.bag[tr] >= 0).sum())} in {len(np.unique(tt.bag[tr][tt.bag[tr] >= 0]))} MIL bags; '
