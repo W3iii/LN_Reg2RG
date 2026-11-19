@@ -168,7 +168,8 @@ def main(args):
         name, path = a.split('=', 1) if '=' in a else (None, a)
         if name is None:
             m = re.search(r'ckpt(\d+)', os.path.basename(path))
-            name = f'ckpt{m.group(1)}' if m else os.path.basename(path)
+            t = re.search(r'_thr([\w.]+)\.csv$', os.path.basename(path))
+            name = (f'ckpt{m.group(1)}' if m else os.path.basename(path)) + (f'_thr{t.group(1)}' if t else '')
         rows.append(dict(run=name, **score(path)))
     df = pd.DataFrame(rows).set_index('run')
     pd.set_option('display.width', 220)
