@@ -48,7 +48,7 @@ class RadGenomeDataset_Train(PersistentDataset):
     # runnable from one checkout -- and, more importantly, a seed sweep started
     # before the lesion work landed keeps producing baseline runs instead of
     # silently switching arms partway through.
-    def __init__(self, text_tokenizer, data_folder, mask_folder, csv_file, cache_dir, max_region_size=5, max_img_size = 1, image_num = 32, region_num=33, max_seq=2048, resize_dim=500, voc_size=32000, force_num_frames=True, nodule_metadata=None, lesion_pred_csv=None, lesion_order='truth', lesion_size_unit='mm', size_placeholder=False, lesion_type=False, lesion_type_min_conf=0.0, lesion_tokens_per_nodule=1):
+    def __init__(self, text_tokenizer, data_folder, mask_folder, csv_file, cache_dir, max_region_size=5, max_img_size = 1, image_num = 32, region_num=33, max_seq=2048, resize_dim=500, voc_size=32000, force_num_frames=True, nodule_metadata=None, lesion_pred_csv=None, lesion_order='truth', lesion_size_unit='mm', size_placeholder=False, lesion_type=False, lesion_type_min_conf=0.0, lesion_tokens_per_nodule=1, lesion_tiers=''):
         # text_tokenizer
         self.text_tokenizer = AutoTokenizer.from_pretrained(
                 text_tokenizer,
@@ -110,7 +110,7 @@ class RadGenomeDataset_Train(PersistentDataset):
                 raise ValueError('v2 report CSV: lesion_pred_csv / lesion_type / size_placeholder are v1 options '
                                  '(sizes are already [SIZE#k] placeholders, filled from the masks)')
             self.reports_v2 = load_v2_reports(csv_file)
-            self.nodule_boxes = load_nodule_boxes(nodule_metadata) if nodule_metadata else None
+            self.nodule_boxes = load_nodule_boxes(nodule_metadata, lesion_tiers) if nodule_metadata else None
             nodule_metadata = None          # the v1 ranking index stays off
             print(f'[dataset] v2 reports: {csv_file}; lesion tokens '
                   + (f'ON ({len(self.nodule_boxes)} nodule boxes, {self.n_tok} token(s) per nodule)'

@@ -131,3 +131,36 @@ cd .. && python evaluation/predict_types_v2.py --ckpt outputs/lesion_enc_vitq_ce
 cd scripts && split=val ckpt_step=1360 bash test_radgenome.sh ncku_a100_v3
 cd .. && python evaluation/eval_v2.py results/Reg2RG_v3_vitq_seed42_val_ckpt*_v3.csv   # + imp BLEU/ROUGE, type fill
 ```
+
+## V3.1 (2026-11-20): lesion slots only for the nodules the report describes
+
+V3 test_me review (oracle GT boxes): whether a lobe gets a finding followed the lesion tokens
+almost one to one -- "finding iff the lobe has lesion tokens" scored F1 0.793 vs the model's
+0.745. Cause: `nodule_ids` lists every nodule with a mask in the lobe, also the ones no
+sentence was matched to (match_tier `none`: mostly < 5 mm, RADS 1, not written up). 21% of
+the train lobes with lesion tokens had a normal target, so the model learned to skip given
+lesions at random (its finding rate was ~0.8 at every nodule size; the radiologists' rose
+from 0.43 at <= 4 mm to 0.93 at > 8 mm), and multi-nodule lobes mixed in undescribed nodules.
+
+`lesion_tiers=A,B,C,X` (`lesion_utils.load_nodule_boxes`) keeps a lesion slot only for those
+tiers; GT text and report CSVs are unchanged (every [SIZE#]/[TYPE#] tag already points at an
+A/X nodule). Lobes with lesion tokens and a normal target:
+
+| split | V3 | V3.1 |
+|---|---|---|
+| train | 513 / 2393 (21%) | 41 / 1921 (2%) |
+| val | 107 / 390 | 6 / 289 |
+| test_me | 102 / 361 | 1 / 260 |
+| test_ldct | 50 / 965 | 10 / 925 |
+
+The oracle is now "the nodules the radiologist wrote up"; deciding which detected nodules to
+report is left to the detector stage. Report V3 and V3.1 side by side.
+
+```bash
+cd scripts && seed=42 bash train_radgenome.sh ncku_a100_v31                        # Reg2RG_v31_vitq
+split=val ckpt_step=1360 bash test_radgenome.sh ncku_a100_v31                      # each saved step
+split=test_me ckpt_step=<chosen> bash test_radgenome.sh ncku_a100_v31              # then test_ldct
+cd .. && python evaluation/refill_types_v3.py results/Reg2RG_v31_vitq_seed42_val_ckpt1360_v3.csv \
+    --report_csv $DATA_ROOT/region_report_v3_val.csv --meta $DATA_ROOT/nodule_metadata_v2.csv \
+    --type_pred outputs/type_pred_vitq_v2.csv --lesion_tiers A,B,C,X
+```

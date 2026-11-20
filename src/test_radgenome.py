@@ -156,6 +156,7 @@ def main():
         cache_dir=data_args.monai_cache_dir,
         inferenced_id = inferenced_id,
         nodule_metadata=data_args.nodule_metadata or None,
+        lesion_tiers=data_args.lesion_tiers,
         lesion_pred_csv=data_args.lesion_pred_csv or None,
         lesion_order=data_args.lesion_order,
         lesion_size_unit=data_args.lesion_size_unit,

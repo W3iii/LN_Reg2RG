@@ -35,10 +35,11 @@ def main():
     ap.add_argument('--meta', required=True, help='nodule_metadata_v2.csv')
     ap.add_argument('--type_pred', required=True, help='predict_types_v2.py output')
     ap.add_argument('--thr', nargs='+', default=['0.5', '0.6', '0.7', '0.8'])
+    ap.add_argument('--lesion_tiers', default='', help="the inference run's lesion_tiers (V3.1: A,B,C,X)")
     a = ap.parse_args()
 
     reports = load_v2_reports(a.report_csv)
-    boxes = load_nodule_boxes(a.meta)
+    boxes = load_nodule_boxes(a.meta, a.lesion_tiers)
     tp = pd.read_csv(a.type_pred)
     preds = {(str(r.Volumename), int(r.nodule_id)): (str(r.pred_type), float(r.pred_conf)) for r in tp.itertuples()}
 

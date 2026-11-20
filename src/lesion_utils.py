@@ -183,13 +183,18 @@ def normalize_lesion(crop, hu_min=-1000.0, hu_max=200.0):
     return ((crop + 400.0) / 600.0).astype(np.float32)
 
 
-def load_nodule_boxes(csv_path):
+def load_nodule_boxes(csv_path, tiers=None):
     """(Volumename, nodule_id) -> (box, eq_diam_mm) from nodule_metadata_v2.csv.
 
     The v2 report CSVs (region_report_v2_*.csv) name each lobe's nodules by id, in the
     order the lobe's [SIZE#<id>] placeholders and lesion slots use (mask size, largest
     first), so the v2 datasets look boxes up by id instead of ranking them here.
     Covers ME and LDCT; LDCT has no TW_Lung_RADS, which nothing here needs.
+
+    tiers: keep only nodules whose match_tier is listed ('A,B,C,X' or a list) -- V3.1, the
+    nodules the report text describes. 'none' = a mask no sentence was matched to (mostly
+    small RADS-1 nodules the radiologist did not write up). Empty / None keeps every nodule.
+    The datasets give a lesion slot only to ids found here, so this is the whole switch.
     """
     df = pd.read_csv(csv_path)
     missing = [c for c in BBOX_COLS + ['Volumename', 'nodule_id', 'eq_diam_mm'] if c not in df.columns]
@@ -198,6 +203,13 @@ def load_nodule_boxes(csv_path):
     df = df.dropna(subset=BBOX_COLS)
     if df.duplicated(['Volumename', 'nodule_id']).any():
         raise ValueError(f'{csv_path}: duplicate (Volumename, nodule_id)')
+    if tiers:
+        keep = {t.strip() for t in (tiers.split(',') if isinstance(tiers, str) else tiers) if t.strip()}
+        if 'match_tier' not in df.columns:
+            raise ValueError(f'{csv_path} has no match_tier column (lesion_tiers needs nodule_metadata_v2.csv)')
+        n0 = len(df)
+        df = df[df['match_tier'].fillna('none').isin(keep)]
+        print(f'[lesion] match_tier in {sorted(keep)}: {len(df)} / {n0} nodules keep a lesion slot')
     return {(str(r.Volumename), int(r.nodule_id)):
             ((int(r.y0_crop), int(r.y1_crop), int(r.x0_crop), int(r.x1_crop), int(r.z0_crop), int(r.z1_crop)),
              float(r.eq_diam_mm))

@@ -28,6 +28,7 @@ CUDA_VISIBLE_DEVICES=$cuda_devices python ../src/${script_name}.py \
     --report_file "$report_file" \
     --monai_cache_dir "$monai_cache_dir" \
     --nodule_metadata "$nodule_metadata" \
+    --lesion_tiers "${lesion_tiers:-}" \
     --lesion_arch "$lesion_arch" \
     --lesion_pred_csv "$lesion_pred_csv" \
     --lesion_order "$lesion_order" \

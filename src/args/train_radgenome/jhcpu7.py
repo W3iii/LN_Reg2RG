@@ -26,6 +26,9 @@ class DataArguments:
     # Empty = lesion tokens off (the B0 baseline). Point it at nodule_metadata.csv
     # to run the B2 lesion arm; see docs/LESION_TOKENS.md.
     nodule_metadata: Optional[str] = field(default='')
+    # V3.1: lesion slots only for nodules whose match_tier is listed ('A,B,C,X' = the nodules the
+    # report describes; see lesion_utils.load_nodule_boxes). Empty = every nodule with a mask (V2 / V3).
+    lesion_tiers: Optional[str] = field(default='')
     # GT v2 / split C: point report_file at region_report_v2_<split>.csv (detected from its
     # nodule_ids / loss_mask columns) and nodule_metadata at nodule_metadata_v2.csv.
     # Sizes are [SIZE#k] placeholders filled from the masks; the B3c-B3g options below are v1-only.
