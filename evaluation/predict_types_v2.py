@@ -58,7 +58,8 @@ def main():
         img = np.asarray(nib.load(find_image(os.path.join(a.data_root, 'images'), vol), mmap=True).dataobj).astype(np.float32)
         X = np.stack([normalize_lesion(crop_lesion(img, tuple(int(r[c]) for c in cols))) for _, r in g.iterrows()])
         with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=device.type == 'cuda'):
-            _, _, tl, _ = net(torch.from_numpy(X)[:, None].to(device))
+            _, _, tl, _ = net(torch.from_numpy(X)[:, None].to(device),
+                              torch.tensor(g['eq_diam_mm'].to_numpy(np.float32), device=device))
         p = F.softmax(tl.float(), 1).cpu().numpy()
         for (_, r), pi in zip(g.iterrows(), p):
             rows.append(dict(Volumename=vol, nodule_id=int(r['nodule_id']), split=r['split'],

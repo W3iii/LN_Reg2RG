@@ -196,11 +196,17 @@ class QueryLesionEncoder(nn.Module):
 
     Attribute names must stay as they are: train_lesion_encoder.py saves this class's
     state_dict and MyEmbedding loads it by key.
+
+    vitq_s (size_token=True, 2026-11-20): the nodule's mask size (equivalent diameter, mm) is an
+    input -- log-scaled, through a small MLP, added to every query before the decoder. Size is a
+    strong prior for type (ME tier A: GGO 66% of <= 4 mm vs 83% of 6-8 mm named types) and half
+    of RADS, and 80% of nodules are <= 6 mm, i.e. 1-2 cells of the grid, so giving it beats
+    reading it off the crop. Same 3 output tokens; forward(x, size_mm).
     """
     QUERY_NAMES = ('size', 'type', 'rads')
 
     def __init__(self, dim=4096, width=32, d_model=256, depth=2, heads=8, dec_depth=2,
-                 n_queries=3, grid=(16, 16, 8), sigma=2.0):
+                 n_queries=3, grid=(16, 16, 8), sigma=2.0, size_token=False):
         super().__init__()
         self.n_tokens = n_queries
         self.net = nn.Sequential(_conv_block(1, width, 2), _conv_block(width, width * 2, 2),
@@ -221,6 +227,9 @@ class QueryLesionEncoder(nn.Module):
 
         self.queries = nn.Parameter(torch.zeros(1, n_queries, d_model))
         nn.init.trunc_normal_(self.queries, std=0.02)
+        self.size_token = size_token
+        if size_token:
+            self.size_embed = nn.Sequential(nn.Linear(1, d_model), nn.GELU(), nn.Linear(d_model, d_model))
         self.sa_norm = nn.ModuleList(nn.LayerNorm(d_model) for _ in range(dec_depth))
         self.self_attn = nn.ModuleList(nn.MultiheadAttention(d_model, heads, batch_first=True)
                                        for _ in range(dec_depth))
@@ -233,14 +242,20 @@ class QueryLesionEncoder(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.fc = nn.Linear(d_model, dim)
 
-    def forward(self, x):
-        # x: (N, 1, 64, 64, 32) -> (N, n_queries, dim)
+    def forward(self, x, size_mm=None):
+        # x: (N, 1, 64, 64, 32) -> (N, n_queries, dim); size_mm: (N,) mask eq. diameter, vitq_s only
         f = self.net(x)                                     # (N, 4*width, 16, 16, 8)
         if tuple(f.shape[2:]) != self.grid:
             raise ValueError(f'feature grid {tuple(f.shape[2:])} != {self.grid}: crop size changed?')
         t = self.proj(f.flatten(2).transpose(1, 2)) + self.pos.to(f.dtype)
         mem = self.mem_norm(self.encoder(t))
         q = self.queries.to(mem.dtype).expand(x.shape[0], -1, -1)
+        if self.size_token:
+            if size_mm is None:
+                raise ValueError('vitq_s needs each nodule\'s size (eq. diameter, mm); '
+                                 'the report model does not pass it yet')
+            z = (torch.log(size_mm.float().clamp(min=0.5)) - SIZE_LOG_CENTRE) / SIZE_LOG_SCALE
+            q = q + self.size_embed(z[:, None].to(mem.dtype))[:, None]
         for sa, sn, att, qn, mn, mlp in zip(self.self_attn, self.sa_norm, self.cross, self.q_norm,
                                             self.mlp_norm, self.mlp):
             h = sn(q)
@@ -250,14 +265,15 @@ class QueryLesionEncoder(nn.Module):
         return self.fc(self.norm(q))
 
 
-LESION_ARCHS = ('gap', 'center', 'attn', 'vitq')
+SIZE_LOG_CENTRE, SIZE_LOG_SCALE = 1.7, 0.5     # log(eq_diam_mm): median ~5.5 mm, most 3-15 mm
+LESION_ARCHS = ('gap', 'center', 'attn', 'vitq', 'vitq_s')
 
 
 def build_lesion_encoder(arch='gap', dim=4096):
     if arch == 'gap':
         return LesionEncoder(dim=dim)
-    if arch == 'vitq':
-        return QueryLesionEncoder(dim=dim)
+    if arch in ('vitq', 'vitq_s'):
+        return QueryLesionEncoder(dim=dim, size_token=arch == 'vitq_s')
     return PooledLesionEncoder(arch, dim=dim)
 
 

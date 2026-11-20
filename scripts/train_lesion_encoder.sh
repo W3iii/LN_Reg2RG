@@ -22,6 +22,9 @@
 #   + MAE-pretrained image path (scripts/pretrain_lesion_mae.sh, LIDC, no labels):
 #   ARCHS=vitq META=... INIT=outputs/lesion_mae_vitq_lidc/mae.pt bash scripts/train_lesion_encoder.sh
 #     -> outputs/lesion_enc_vitq_ce_mil_v2_mae_seed0/best.pt
+#   vitq_s = vitq + the mask size as an input token (same MAE file works):
+#   ARCHS=vitq_s META=... INIT=outputs/lesion_mae_vitq_lidc/mae.pt bash scripts/train_lesion_encoder.sh
+#     -> outputs/lesion_enc_vitq_s_ce_mil_v2_mae_seed0/best.pt
 set -eu
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 export PYTHONWARNINGS=ignore

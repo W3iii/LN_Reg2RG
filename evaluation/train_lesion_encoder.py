@@ -312,8 +312,8 @@ class Net(nn.Module):
         super().__init__()
         if arch == 'gap':
             self.enc = LesionEncoder(dim=4096)
-        elif arch == 'vitq':
-            self.enc = QueryLesionEncoder(dim=4096)
+        elif arch in ('vitq', 'vitq_s'):
+            self.enc = QueryLesionEncoder(dim=4096, size_token=arch == 'vitq_s')
         else:
             self.enc = PooledLesionEncoder(arch)
         self.size_head = nn.Sequential(nn.LayerNorm(4096), nn.Linear(4096, 1))
@@ -321,8 +321,9 @@ class Net(nn.Module):
         self.type_head = nn.Sequential(nn.LayerNorm(4096), nn.Linear(4096, N_TYPES))
         self.g = nn.Sequential(nn.Linear(1 + N_TYPES, 32), nn.GELU(), nn.Linear(32, 4))
 
-    def forward(self, x):
-        t = self.enc(x)
+    def forward(self, x, size_mm=None):
+        # vitq_s gets the mask size as an input (its size head is then a sanity check, not a result)
+        t = self.enc(x, size_mm) if getattr(self.enc, 'size_token', False) else self.enc(x)
         if t.dim() == 3:          # vitq: one token per attribute query (QueryLesionEncoder.QUERY_NAMES)
             return self.size_head(t[:, 0])[:, 0], self.rads_head(t[:, 2]), self.type_head(t[:, 1]), t
         return self.size_head(t)[:, 0], self.rads_head(t), self.type_head(t), t
@@ -336,7 +337,7 @@ class Net(nn.Module):
 def load_mae_init(enc, path, arch):
     """Image path of the encoder from pretrain_lesion_mae.py; queries / decoder / fc stay random."""
     blob = torch.load(path, map_location='cpu', weights_only=False)
-    if blob.get('arch') != arch:
+    if blob.get('arch') != {'vitq_s': 'vitq'}.get(arch, arch):        # vitq_s = vitq + size input
         raise SystemExit(f'{path} is an arch={blob.get("arch")!r} encoder, not {arch!r}')
     pre = tuple(blob.get('pretrained_prefixes', ()))
     sd = {k: v for k, v in blob['encoder'].items() if pre and k.startswith(pre)}
@@ -494,7 +495,7 @@ def evaluate(model, loader, device, tt=None, concept=False):
     P, L, T, C, Y, R, rows = [], [], [], [], [], [], []
     for x, logd, rads, row in loader:
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=device.type == 'cuda'):
-            s, r, t, _ = model(x.to(device))
+            s, r, t, _ = model(x.to(device), logd.to(device).exp())
         tp = F.softmax(t.float(), 1)
         P.append(s.float().cpu()); L.append(F.softmax(r.float(), 1).cpu()); T.append(tp.cpu())
         C.append(F.softmax(model.concept(s, tp), 1).cpu())
@@ -588,7 +589,7 @@ def fmt_type(m):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--arch', choices=['gap', 'center', 'attn', 'vitq'], required=True)
+    ap.add_argument('--arch', choices=['gap', 'center', 'attn', 'vitq', 'vitq_s'], required=True)
     ap.add_argument('--data_root', default='/root/notebooks/groups/BME/reg2rg_nifti')
     ap.add_argument('--meta', default=None, help='nodule metadata csv (default <data_root>/nodule_metadata.csv; '
                     'split C: <data_root>/nodule_metadata_v2.csv)')
@@ -668,7 +669,7 @@ def main():
         for x, ld, r, rows in dl_tr:
             x, ld, r, rows = x.to(device), ld.to(device), r.to(device), rows.to(device)
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=device.type == 'cuda'):
-                o = model(x)
+                o = model(x, ld.exp())
             loss, p = obj(o, ld, r, rows, ep)
             opt.zero_grad(set_to_none=True); loss.backward(); opt.step(); sched.step()
             tot += loss.item(); nb += 1
