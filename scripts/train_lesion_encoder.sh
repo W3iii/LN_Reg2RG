@@ -19,6 +19,9 @@
 #   + LIDC type labels (data_prep/lidc/build_lidc_lesions.py), train only, no RADS:
 #   ARCHS=vitq META=... EXTRA=outputs/lidc_lesion_crops.npy bash scripts/train_lesion_encoder.sh
 #     -> outputs/lesion_enc_vitq_ce_mil_v2_lidc_seed0/best.pt
+#   + MAE-pretrained image path (scripts/pretrain_lesion_mae.sh, LIDC, no labels):
+#   ARCHS=vitq META=... INIT=outputs/lesion_mae_vitq_lidc/mae.pt bash scripts/train_lesion_encoder.sh
+#     -> outputs/lesion_enc_vitq_ce_mil_v2_mae_seed0/best.pt
 set -eu
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 export PYTHONWARNINGS=ignore
@@ -41,6 +44,9 @@ if [ -n "$META" ]; then META_ARGS="--meta $META"; META_SFX="_v2"; fi
 EXTRA="${EXTRA:-}"                     # extra training crops, e.g. outputs/lidc_lesion_crops.npy (+ .npy.csv)
 EXTRA_ARGS=""; EXTRA_SFX=""
 if [ -n "$EXTRA" ]; then EXTRA_ARGS="--extra_train $EXTRA"; EXTRA_SFX="_lidc"; fi
+INIT="${INIT:-}"                       # MAE-pretrained encoder, e.g. outputs/lesion_mae_vitq_lidc/mae.pt
+INIT_ARGS=""; INIT_SFX=""
+if [ -n "$INIT" ]; then INIT_ARGS="--init_encoder $INIT"; INIT_SFX="_mae"; fi
 case "$CONCEPT" in
   1|joint) CBM_ARGS="--concept joint --w_cbm $W_CBM --w_consist $W_CONSIST"; CBM_SFX=_cbm ;;
   frozen)  CBM_ARGS="--concept frozen --w_cbm ${W_CBM_FROZEN:-0.3}"; CBM_SFX=_cbmfrozen ;;
@@ -49,13 +55,13 @@ esac
 mkdir -p outputs/seed_sweep_logs
 for arch in $ARCHS; do
   for tl in $TYPE_LOSSES; do
-    log="outputs/seed_sweep_logs/lesion_enc_${arch}_${tl}${CBM_SFX}${META_SFX}${EXTRA_SFX}_seed${SEED}.log"
+    log="outputs/seed_sweep_logs/lesion_enc_${arch}_${tl}${CBM_SFX}${META_SFX}${EXTRA_SFX}${INIT_SFX}_seed${SEED}.log"
     LOGS="${LOGS:-} $log"
     echo "=== $arch type_loss=$tl concept=$CONCEPT -> $log"
     CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" "$PY" evaluation/train_lesion_encoder.py \
         --arch "$arch" --type_loss "$tl" --data_root "$DATA_ROOT" --epochs "$EPOCHS" --seed "$SEED" \
-        --w_type "$W_TYPE" --w_mil "$W_MIL" --mil_warmup "$MIL_WARMUP" $CBM_ARGS $META_ARGS $EXTRA_ARGS \
-        ${META:+--out outputs/lesion_enc_${arch}_${tl}${CBM_SFX}${META_SFX}${EXTRA_SFX}_seed${SEED}} 2>&1 | tee "$log"
+        --w_type "$W_TYPE" --w_mil "$W_MIL" --mil_warmup "$MIL_WARMUP" $CBM_ARGS $META_ARGS $EXTRA_ARGS $INIT_ARGS \
+        ${META:+--out outputs/lesion_enc_${arch}_${tl}${CBM_SFX}${META_SFX}${EXTRA_SFX}${INIT_SFX}_seed${SEED}} 2>&1 | tee "$log"
   done
 done
 echo

@@ -31,6 +31,11 @@ Extra training crops (--extra_train, e.g. LIDC-IDRI from data_prep/lidc/build_li
 appended to the training set only, with size and type labels and no RADS label (its loss is
 masked for those rows). Validation and model selection stay on ME val.
 
+MAE initialisation (--init_encoder, vitq only): start the image path of the encoder (conv trunk,
+proj, pos, grid transformer, mem_norm) from evaluation/pretrain_lesion_mae.py's mae.pt, masked-image
+pretraining on unlabelled LIDC crops (data_prep/lidc/build_lidc_mae.py). The queries, their decoder
+blocks, fc and the heads start random and everything is trained on ME as usual.
+
 Data (split C, 2026-11): --meta $DATA_ROOT/nodule_metadata_v2.csv. Only train / val rows with
 a TW_Lung_RADS grade are cached, i.e. ME only; LDCT is test_ldct and never read here. The
 crop cache and the type labels are named after the metadata file, so the old-split cache
@@ -328,6 +333,22 @@ class Net(nn.Module):
         return self.g(torch.cat([z, type_probs.float()], 1))
 
 
+def load_mae_init(enc, path, arch):
+    """Image path of the encoder from pretrain_lesion_mae.py; queries / decoder / fc stay random."""
+    blob = torch.load(path, map_location='cpu', weights_only=False)
+    if blob.get('arch') != arch:
+        raise SystemExit(f'{path} is an arch={blob.get("arch")!r} encoder, not {arch!r}')
+    pre = tuple(blob.get('pretrained_prefixes', ()))
+    sd = {k: v for k, v in blob['encoder'].items() if pre and k.startswith(pre)}
+    missing, unexpected = enc.load_state_dict(sd, strict=False)
+    if unexpected or not sd:
+        raise SystemExit(f'{path}: {len(sd)} tensors to load, unexpected {unexpected[:5]}')
+    mae = blob.get('mae', {})
+    print(f'[init] {path}: {len(sd)} tensors ({sum(v.numel() for v in sd.values()) / 1e6:.2f}M) from MAE epoch '
+          f'{mae.get("epoch")} (held-out L1 {mae.get("val_l1", float("nan")):.4f}); start random: '
+          + ', '.join(sorted({k.split('.')[0] for k in missing})))
+
+
 def checkpoint(model, arch, metrics, **extra):
     return {'arch': arch, 'encoder': model.enc.state_dict(),
             'size_head': model.size_head.state_dict(), 'rads_head': model.rads_head.state_dict(),
@@ -574,6 +595,8 @@ def main():
     ap.add_argument('--cache', default=None, help='crop cache .npy (default named after --meta)')
     ap.add_argument('--extra_train', default=None, help='extra training crops .npy with labels in <npy>.csv '
                     '(Volumename, nodule_id, eq_diam_mm, type_set), e.g. LIDC; no RADS, train only')
+    ap.add_argument('--init_encoder', default=None, help='mae.pt of evaluation/pretrain_lesion_mae.py: start the '
+                    "encoder's image path from MAE pretraining (vitq)")
     ap.add_argument('--epochs', type=int, default=40)
     ap.add_argument('--bs', type=int, default=64)
     ap.add_argument('--lr', type=float, default=3e-4)
@@ -625,7 +648,10 @@ def main():
     dl_tr = train_loader(X, logd, rads, tr, tt.bag, a.bs, a.workers, a.seed)
     dl_va = eval_loader(X, logd, rads, va, a.bs, a.workers)
 
-    model = Net(a.arch).to(device)
+    model = Net(a.arch)
+    if a.init_encoder:
+        load_mae_init(model.enc, a.init_encoder, a.arch)
+    model = model.to(device)
     if a.concept == 'frozen':
         pretrain_g(model, logd, rads, tt, tr, device, seed=a.seed)
     obj = Objective(a, rads[tr], tt, tr, device, model)
@@ -656,7 +682,8 @@ def main():
         flag = ''
         if score > best_score:
             best_score, best = score, m
-            torch.save(checkpoint(model, a.arch, m, type_loss=a.type_loss, concept=a.concept), os.path.join(out, 'best.pt'))
+            torch.save(checkpoint(model, a.arch, m, type_loss=a.type_loss, concept=a.concept,
+                                  init_encoder=a.init_encoder), os.path.join(out, 'best.pt'))
             flag = ' *'
         lp = ' '.join(f'{k} {v / nb:.3f}' for k, v in parts.items())
         print(f'ep {ep+1:3d} loss {m["train_loss"]:.3f} ({lp}) | val rho {m["rho"]:.3f} MAE(>=6) {m["MAE_ge6"]:.2f} '

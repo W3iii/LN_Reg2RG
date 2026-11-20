@@ -164,3 +164,27 @@ cd .. && python evaluation/refill_types_v3.py results/Reg2RG_v31_vitq_seed42_val
     --report_csv $DATA_ROOT/region_report_v3_val.csv --meta $DATA_ROOT/nodule_metadata_v2.csv \
     --type_pred outputs/type_pred_vitq_v2.csv --lesion_tiers A,B,C,X
 ```
+
+## Lesion encoder: MAE on LIDC, then ME (2026-11-20)
+
+Question: does self-supervised pretraining on unlabelled LIDC crops give the vitq encoder a better
+start than random init for the ME size / type / RADS training? (LIDC type labels as extra
+supervised crops, `--extra_train`, gave nothing: rho 0.802 / kappa 0.709 / type bacc 0.450 vs
+0.787 / 0.730 / 0.453.)
+
+1. Workstation: `F:\DataSet\lidc_lesions\run_lidc_mae.bat` (`data_prep/lidc/build_lidc_mae.py`):
+   every reader-marked nodule (any reader count, < 3 mm too) + 10 random lung crops per series,
+   same crop geometry / normalisation as ME -> `lidc_mae_crops.npy` (+ `.npy.csv`), ~17k crops.
+   Upload both to `outputs/` on the server.
+2. `bash scripts/pretrain_lesion_mae.sh` (`evaluation/pretrain_lesion_mae.py`): SimMIM-style
+   masked-image modelling of the encoder's image path (conv trunk -> proj -> pos -> grid
+   transformer -> mem_norm). 60% of 2x2x2-cell blocks (6.4 x 6.4 x 8 mm) masked at the input
+   and replaced by a mask token, linear head reconstructs the masked voxels, L1. 100 epochs.
+   -> `outputs/lesion_mae_vitq_lidc/mae.pt` + `recon_qc.png`.
+3. ME training from it: `INIT=outputs/lesion_mae_vitq_lidc/mae.pt` in `scripts/train_lesion_encoder.sh`
+   (`--init_encoder`; queries / decoder / fc / heads start random) ->
+   `outputs/lesion_enc_vitq_ce_mil_v2_mae_seed<k>/`.
+
+Compare seeds 0-2 with and without INIT on ME val (157 patients, part-solid n = 1, so one seed
+is not enough). Only if MAE wins: point `lesion_encoder_ckpt` of the report model at it,
+re-run predict_types_v2.py and retrain the LLM.
