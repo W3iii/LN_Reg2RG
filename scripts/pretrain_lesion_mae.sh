@@ -1,7 +1,8 @@
 #!/bin/bash
 # MAE pretraining of the vitq lesion encoder on LIDC crops (evaluation/pretrain_lesion_mae.py),
 # then the usual ME size / type / RADS training started from it (train_lesion_encoder.py --init_encoder).
-#   crops: data_prep/lidc/build_lidc_mae.py on the workstation -> upload lidc_mae_crops.npy + .npy.csv to outputs/
+#   crops: data_prep/lidc/build_lidc_mae.py on the workstation -> upload lidc_mae_crops.npy + .npy.csv to
+#   /root/notebooks/groups/BME/lidc_lesions/ (or set DATA=...)
 #   bash scripts/pretrain_lesion_mae.sh                         # -> outputs/lesion_mae_vitq_lidc/mae.pt (+ recon_qc.png)
 #   ARCHS=vitq TYPE_LOSSES=ce_mil META=$DATA_ROOT/nodule_metadata_v2.csv INIT=outputs/lesion_mae_vitq_lidc/mae.pt \
 #     SEED=0 bash scripts/train_lesion_encoder.sh              # -> outputs/lesion_enc_vitq_ce_mil_v2_mae_seed0/best.pt
@@ -11,7 +12,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 export PYTHONWARNINGS=ignore
 VENV="${VENV:-/root/notebooks/automl/env}"
 PY="$VENV/bin/python"
-DATA="${DATA:-outputs/lidc_mae_crops.npy}"      # several files: DATA="a.npy b.npy"
+DATA="${DATA:-/root/notebooks/groups/BME/lidc_lesions/lidc_mae_crops.npy}"      # several files: DATA="a.npy b.npy"
 OUT="${OUT:-outputs/lesion_mae_vitq_lidc}"
 EPOCHS="${EPOCHS:-100}"
 BS="${BS:-128}"

@@ -175,7 +175,7 @@ supervised crops, `--extra_train`, gave nothing: rho 0.802 / kappa 0.709 / type 
 1. Workstation: `F:\DataSet\lidc_lesions\run_lidc_mae.bat` (`data_prep/lidc/build_lidc_mae.py`):
    every reader-marked nodule (any reader count, < 3 mm too) + 10 random lung crops per series,
    same crop geometry / normalisation as ME -> `lidc_mae_crops.npy` (+ `.npy.csv`), ~17k crops.
-   Upload both to `outputs/` on the server.
+   Upload both to `/root/notebooks/groups/BME/lidc_lesions/` on the server (`DATA=` to change).
 2. `bash scripts/pretrain_lesion_mae.sh` (`evaluation/pretrain_lesion_mae.py`): SimMIM-style
    masked-image modelling of the encoder's image path (conv trunk -> proj -> pos -> grid
    transformer -> mem_norm). 60% of 2x2x2-cell blocks (6.4 x 6.4 x 8 mm) masked at the input
