@@ -25,6 +25,8 @@ import torch.nn.functional as F
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from train_lesion_encoder import Net, TYPES, find_image, crop_lesion, normalize_lesion  # noqa: E402
+from lesion_utils import lesion_views                                                   # noqa: E402
+from Model.my_embedding_layer import vitq_options                                       # noqa: E402
 
 
 def main():
@@ -54,12 +56,28 @@ def main():
     nm = nm[nm['split'].isin(a.splits)].reset_index(drop=True)
     cols = ('y0_crop', 'y1_crop', 'x0_crop', 'x1_crop', 'z0_crop', 'z1_crop')
     rows = []
+    opt = vitq_options(blob['arch']) if str(blob['arch']).startswith('vitq') else dict(in_ch=1, zoom=False)
+    views = opt['in_ch'] > 1 or opt['zoom']
     for vi, (vol, g) in enumerate(nm.groupby('Volumename', sort=False)):
-        img = np.asarray(nib.load(find_image(os.path.join(a.data_root, 'images'), vol), mmap=True).dataobj).astype(np.float32)
-        X = np.stack([normalize_lesion(crop_lesion(img, tuple(int(r[c]) for c in cols))) for _, r in g.iterrows()])
+        im = nib.load(find_image(os.path.join(a.data_root, 'images'), vol), mmap=True)
+        img = np.asarray(im.dataobj).astype(np.float32)
+        size = torch.tensor(g['eq_diam_mm'].to_numpy(np.float32), device=device)
+        if views:      # crop + nodule mask channel and / or zoom view, exactly as build_view_cache
+            folder = vol[:-7] if vol.endswith('.nii.gz') else vol
+            lab = np.asarray(nib.load(os.path.join(a.data_root, 'masks', f'seg_{folder}', 'nodules.nii.gz')).dataobj)
+            sp = tuple(float(s) for s in im.header.get_zooms()[:3])
+            vs = [lesion_views(img, lab, int(r['nodule_id']), tuple(int(r[c]) for c in cols), r['eq_diam_mm'], sp)
+                  for _, r in g.iterrows()]
+            x = np.stack([np.stack([v[0], v[1]]) if opt['in_ch'] == 2 else v[0][None] for v in vs])
+            inp = {'x': torch.from_numpy(x.astype(np.float32)).to(device)}
+            if opt['zoom']:
+                z = np.stack([np.stack([v[2], v[3]]) if opt['in_ch'] == 2 else v[2][None] for v in vs])
+                inp['z'] = torch.from_numpy(z.astype(np.float32)).to(device)
+        else:
+            X = np.stack([normalize_lesion(crop_lesion(img, tuple(int(r[c]) for c in cols))) for _, r in g.iterrows()])
+            inp = torch.from_numpy(X)[:, None].to(device)
         with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=device.type == 'cuda'):
-            _, _, tl, _ = net(torch.from_numpy(X)[:, None].to(device),
-                              torch.tensor(g['eq_diam_mm'].to_numpy(np.float32), device=device))
+            _, _, tl, _ = net(inp, size)
         p = F.softmax(tl.float(), 1).cpu().numpy()
         for (_, r), pi in zip(g.iterrows(), p):
             rows.append(dict(Volumename=vol, nodule_id=int(r['nodule_id']), split=r['split'],

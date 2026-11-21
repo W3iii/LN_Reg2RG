@@ -34,7 +34,7 @@ MAX_LESION_PER_REGION = 8
 # Tokens one nodule occupies in the prompt, per lesion encoder architecture.
 # vitq (QueryLesionEncoder) emits one token per attribute query (size, type, RADS);
 # every other encoder emits a single token, which keeps B2/B3* byte-identical.
-TOKENS_PER_LESION = {'gap': 1, 'center': 1, 'attn': 1, 'vitq': 3, 'vitq_s': 3}
+TOKENS_PER_LESION = {'gap': 1, 'center': 1, 'attn': 1, 'vitq': 3, 'vitq_s': 3, 'vitq_sm': 3, 'vitq_sz': 3, 'vitq_szm': 3}
 
 
 def tokens_per_lesion(lesion_arch):

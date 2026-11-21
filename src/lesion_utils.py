@@ -177,6 +177,56 @@ def crop_lesion(img, bbox, size=LESION_CROP_SIZE):
     return out
 
 
+# ---- extra views for the vitq_*m / vitq_*z encoders (2026-11-21) -------------------------------
+# Mask channel: the nodule's own voxels (instance mask == nodule_id) in the same 64x64x32 window as
+# the crop, so the encoder knows which voxels are the nodule. Zoom view: an isotropic window of
+# max(ZOOM_FACTOR x eq. diameter, ZOOM_MIN_MM) around the box centre, resampled to ZOOM_SIZE, so a
+# 4 mm nodule fills ~1/3 of the view instead of 1-2 cells of the 16x16x8 grid (80% of ME nodules
+# are <= 6 mm). The absolute size the zoom throws away comes back through the size token (vitq_s).
+ZOOM_SIZE = (32, 32, 16)
+ZOOM_FACTOR = 3.0
+ZOOM_MIN_MM = 16.0
+
+
+def zoom_fov_mm(eq_diam_mm):
+    """In-plane field of view of the zoom view (mm); z covers half of it at the same spacing."""
+    return max(ZOOM_FACTOR * float(eq_diam_mm), ZOOM_MIN_MM)
+
+
+def crop_zoom(vol, bbox, eq_diam_mm, spacing, order=1, cval=0.0):
+    """ZOOM_SIZE window centred on the box centre, isotropic voxels of fov / ZOOM_SIZE[0] mm."""
+    from scipy.ndimage import map_coordinates
+    y0, y1, x0, x1, z0, z1 = bbox
+    c = ((y0 + y1 - 1) / 2.0, (x0 + x1 - 1) / 2.0, (z0 + z1 - 1) / 2.0)
+    step = zoom_fov_mm(eq_diam_mm) / ZOOM_SIZE[0]
+    axes = [c[a] + (np.arange(n) - (n - 1) / 2.0) * step / float(spacing[a]) for a, n in enumerate(ZOOM_SIZE)]
+    grid = np.meshgrid(*axes, indexing='ij')
+    return map_coordinates(np.asarray(vol, dtype=np.float32), grid, order=order, mode='constant', cval=cval)
+
+
+def nodule_mask(labels, nodule_id, bbox):
+    """Instance mask of one nodule; the box itself when the label map has no voxel for it
+    (region_source = doc_bbox: 10 of 4,765 ME train/val nodules)."""
+    m = (np.asarray(labels) == nodule_id)
+    if not m.any():
+        y0, y1, x0, x1, z0, z1 = bbox
+        m = np.zeros(np.shape(labels), dtype=bool)
+        m[max(y0, 0):y1, max(x0, 0):x1, max(z0, 0):z1] = True
+    return m
+
+
+def lesion_views(img, labels, nodule_id, bbox, eq_diam_mm, spacing=(0.8, 0.8, 1.0)):
+    """Everything the encoders can read for one nodule:
+    x (64,64,32) float32 normalised crop, m (64,64,32) uint8 mask, z (32,32,16) float32 normalised
+    zoom, zm (32,32,16) uint8 zoom mask. Outside the volume: air for the image, 0 for the mask."""
+    m = nodule_mask(labels, nodule_id, bbox)
+    x = normalize_lesion(crop_lesion(img, bbox))
+    mc = crop_lesion(m.astype(np.float32), bbox) > 0.5
+    z = normalize_lesion(crop_zoom(img, bbox, eq_diam_mm, spacing, order=1, cval=-1024.0))
+    zm = crop_zoom(m.astype(np.float32), bbox, eq_diam_mm, spacing, order=1) > 0.5
+    return x, mc.astype(np.uint8), z, zm.astype(np.uint8)
+
+
 def normalize_lesion(crop, hu_min=-1000.0, hu_max=200.0):
     """Same HU window and scaling the region pathway applies to lobe volumes."""
     crop = np.clip(crop, hu_min, hu_max)

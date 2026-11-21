@@ -25,6 +25,10 @@
 #   vitq_s = vitq + the mask size as an input token (same MAE file works):
 #   ARCHS=vitq_s META=... INIT=outputs/lesion_mae_vitq_lidc/mae.pt bash scripts/train_lesion_encoder.sh
 #     -> outputs/lesion_enc_vitq_s_ce_mil_v2_mae_seed0/best.pt
+#   vitq_sm / vitq_sz / vitq_szm = vitq_s + nodule mask channel / zoom view / both (lesion_utils.lesion_views);
+#   the first run builds lesion_crops_trainval_nodule_metadata_v2_{mask,zoom,zoommask}.npy (~15 min) --
+#   let it finish before starting the others in parallel:
+#   ARCHS=vitq_szm META=... INIT=outputs/lesion_mae_vitq_lidc/mae.pt bash scripts/train_lesion_encoder.sh
 set -eu
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 export PYTHONWARNINGS=ignore

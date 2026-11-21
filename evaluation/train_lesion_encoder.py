@@ -102,8 +102,8 @@ sys.path.insert(0, os.path.join(HERE, '..', 'src'))
 sys.path.insert(0, os.path.join(HERE, '..', 'data_prep'))
 sys.path.insert(0, HERE)
 
-from Model.my_embedding_layer import LesionEncoder, PooledLesionEncoder, QueryLesionEncoder  # noqa: E402  (single source: MyEmbedding loads these state_dicts)
-from lesion_utils import crop_lesion, normalize_lesion, BBOX_COLS  # noqa: E402
+from Model.my_embedding_layer import LesionEncoder, PooledLesionEncoder, QueryLesionEncoder, vitq_options  # noqa: E402  (single source: MyEmbedding loads these state_dicts)
+from lesion_utils import crop_lesion, normalize_lesion, lesion_views, BBOX_COLS  # noqa: E402
 from extract_lesion_features import find_image                    # noqa: E402
 from build_nodule_type import TYPES, build as build_type_labels   # noqa: E402
 
@@ -151,6 +151,77 @@ def build_cache(data_root, meta_csv, cache, splits=('train', 'val')):
     keep = [c for c in ('pid', 'Volumename', 'split', 'nodule_id', 'region', 'lobe', 'eq_diam_mm', 'tw_lung_rads') if c in nm.columns]
     nm[keep].to_csv(cache + '.csv', index=False)
     print(f'wrote {cache} {X.shape} ({X.nbytes/1e9:.2f} GB)')
+
+
+VIEW_FILES = {'m': '_mask.npy', 'z': '_zoom.npy', 'zm': '_zoommask.npy'}
+
+
+def view_paths(cache):
+    base = cache[:-4] if cache.endswith('.npy') else cache
+    return {k: base + suf for k, suf in VIEW_FILES.items()}
+
+
+def build_view_cache(data_root, meta_csv, cache):
+    """Mask channel + zoom view (lesion_utils.lesion_views) for the rows of an existing crop cache."""
+    import nibabel as nib
+    rows = pd.read_csv(cache + '.csv')
+    nm = pd.read_csv(meta_csv)[['Volumename', 'nodule_id'] + BBOX_COLS]
+    rows = rows[['Volumename', 'nodule_id', 'eq_diam_mm']].merge(nm, on=['Volumename', 'nodule_id'], how='left',
+                                                                validate='one_to_one')
+    n = len(rows)
+    out = {'m': np.zeros((n, 64, 64, 32), np.uint8), 'z': np.zeros((n, 32, 32, 16), np.float16),
+           'zm': np.zeros((n, 32, 32, 16), np.uint8)}
+    t0 = time.time()
+    vols = list(dict.fromkeys(rows['Volumename']))
+    for vi, vol in enumerate(vols):
+        im = nib.load(find_image(os.path.join(data_root, 'images'), vol), mmap=True)
+        img = np.asarray(im.dataobj).astype(np.float32)
+        folder = vol[:-7] if vol.endswith('.nii.gz') else vol
+        lab = np.asarray(nib.load(os.path.join(data_root, 'masks', f'seg_{folder}', 'nodules.nii.gz')).dataobj)
+        sp = tuple(float(s) for s in im.header.get_zooms()[:3])
+        for r in rows.index[rows['Volumename'] == vol]:
+            b = tuple(int(rows.at[r, c]) for c in BBOX_COLS)
+            _, m, z, zm = lesion_views(img, lab, int(rows.at[r, 'nodule_id']), b, rows.at[r, 'eq_diam_mm'], sp)
+            out['m'][r], out['z'][r], out['zm'][r] = m, z, zm
+        if (vi + 1) % 100 == 0:
+            print(f'  views {vi + 1}/{len(vols)} volumes {time.time() - t0:.0f}s', flush=True)
+    for k, p in view_paths(cache).items():
+        np.save(p, out[k])
+    print(f'wrote {sorted(view_paths(cache).values())}; empty native masks: {int((out["m"].reshape(n, -1).max(1) == 0).sum())}')
+
+
+def load_views(X, cache, arch, data_root, meta_csv):
+    """X (the crop array) alone, or a dict of the views the arch reads: x [+ m] [+ z (+ zm)]."""
+    o = vitq_options(arch) if arch.startswith('vitq') else dict(in_ch=1, zoom=False)
+    if o['in_ch'] == 1 and not o['zoom']:
+        return X
+    paths = view_paths(cache)
+    if not all(os.path.exists(p) for p in paths.values()):
+        print(f'[views] building {sorted(paths.values())} (mask channel + zoom view, one pass over the volumes)')
+        build_view_cache(data_root, meta_csv, cache)
+    V = {k: np.load(p, mmap_mode='r') for k, p in paths.items()}
+    if any(len(v) != len(X) for v in V.values()):
+        raise SystemExit(f'view caches {sorted(paths.values())} do not match {cache}; delete them to rebuild')
+    out = {'x': X}
+    if o['in_ch'] == 2:
+        out['m'] = V['m']
+    if o['zoom']:
+        out['z'] = V['z']
+        if o['in_ch'] == 2:
+            out['zm'] = V['zm']
+    print(f'[views] {arch}: ' + ', '.join(f'{k} {tuple(v.shape)}' for k, v in out.items()))
+    return out
+
+
+def subset(X, idx):
+    """Rows idx of the crop array, or of every view in a dict of views (loaded into memory)."""
+    if isinstance(X, dict):
+        return {k: np.asarray(v[idx]) for k, v in X.items()}
+    return np.asarray(X[idx])
+
+
+def to_device(x, device):
+    return {k: v.to(device) for k, v in x.items()} if isinstance(x, dict) else x.to(device)
 
 
 class TypeTargets:
@@ -213,24 +284,53 @@ class TypeTargets:
 
 
 class Crops(torch.utils.data.Dataset):
-    """Returns (crop, log diam, rads, row) -- row indexes the cache, for type targets."""
+    """Returns (crop, log diam, rads, row) -- row indexes the cache, for type targets.
+
+    With views (a dict from load_views) the crop is a dict too: 'x' (C, 64, 64, 32) with the mask
+    as channel 1 when present, and 'z' (C, 32, 32, 16) the zoom view (+ its mask). Flips are shared
+    by all views; the jitter is per view (+-2 voxels native, +-1 zoom)."""
 
     def __init__(self, X, logd, rads, augment, rows=None):
         self.X, self.logd, self.rads, self.augment = X, logd, rads, augment
-        self.rows = np.arange(len(X)) if rows is None else np.asarray(rows)
+        n = len(X['x']) if isinstance(X, dict) else len(X)
+        self.rows = np.arange(n) if rows is None else np.asarray(rows)
 
     def __len__(self):
-        return len(self.X)
+        return len(self.rows)
+
+    def _aug(self, arrs, flips, jit):
+        out = []
+        for a in arrs:
+            for ax, f in zip((0, 1), flips):         # in-plane flips; z kept (cranio-caudal)
+                if f:
+                    a = np.flip(a, ax)
+            if jit is not None:
+                a = np.roll(a, jit, axis=(0, 1, 2))
+            out.append(np.ascontiguousarray(a))
+        return out
 
     def __getitem__(self, i):
-        x = self.X[i].astype(np.float32)
-        if self.augment:
-            for ax in (0, 1):                       # in-plane flips; z kept (cranio-caudal)
-                if np.random.rand() < 0.5:
-                    x = np.flip(x, ax)
-            sy, sx, sz = np.random.randint(-2, 3, 3)  # small jitter; the nodule stays central
-            x = np.roll(x, (sy, sx, int(sz) // 2), axis=(0, 1, 2))
-        return torch.from_numpy(np.ascontiguousarray(x))[None], self.logd[i], self.rads[i], int(self.rows[i])
+        if not isinstance(self.X, dict):            # unchanged single-crop path (same random stream)
+            x = self.X[i].astype(np.float32)
+            if self.augment:
+                for ax in (0, 1):                   # in-plane flips; z kept (cranio-caudal)
+                    if np.random.rand() < 0.5:
+                        x = np.flip(x, ax)
+                sy, sx, sz = np.random.randint(-2, 3, 3)  # small jitter; the nodule stays central
+                x = np.roll(x, (sy, sx, int(sz) // 2), axis=(0, 1, 2))
+            return torch.from_numpy(np.ascontiguousarray(x))[None], self.logd[i], self.rads[i], int(self.rows[i])
+        flips = np.random.rand(2) < 0.5 if self.augment else (False, False)
+        def jitter(r):                              # small jitter; the nodule stays central
+            if not self.augment:
+                return None
+            sy, sx, sz = np.random.randint(-r, r + 1, 3)
+            return (int(sy), int(sx), int(sz) // 2 if r > 1 else int(sz))
+        nat = [self.X['x'][i].astype(np.float32)] + ([self.X['m'][i].astype(np.float32)] if 'm' in self.X else [])
+        out = {'x': torch.from_numpy(np.stack(self._aug(nat, flips, jitter(2))))}
+        if 'z' in self.X:
+            zz = [self.X['z'][i].astype(np.float32)] + ([self.X['zm'][i].astype(np.float32)] if 'zm' in self.X else [])
+            out['z'] = torch.from_numpy(np.stack(self._aug(zz, flips, jitter(1))))
+        return out, self.logd[i], self.rads[i], int(self.rows[i])
 
 
 class BagBatchSampler(torch.utils.data.Sampler):
@@ -267,7 +367,7 @@ class BagBatchSampler(torch.utils.data.Sampler):
 
 
 def train_loader(X, logd, rads, idx, bag, bs, workers, seed):
-    ds = Crops(np.asarray(X[idx]), logd[idx], rads[idx], True, rows=idx)
+    ds = Crops(subset(X, idx), logd[idx], rads[idx], True, rows=idx)
     return torch.utils.data.DataLoader(ds, batch_sampler=BagBatchSampler(bag[idx], bs, seed), num_workers=workers)
 
 
@@ -290,7 +390,7 @@ def one_cycle(opt, lr, epochs, dl):
 
 
 def eval_loader(X, logd, rads, idx, bs, workers=0):
-    return torch.utils.data.DataLoader(Crops(np.asarray(X[idx]), logd[idx], rads[idx], False, rows=idx),
+    return torch.utils.data.DataLoader(Crops(subset(X, idx), logd[idx], rads[idx], False, rows=idx),
                                        batch_size=bs, shuffle=False, num_workers=workers)
 
 
@@ -312,8 +412,8 @@ class Net(nn.Module):
         super().__init__()
         if arch == 'gap':
             self.enc = LesionEncoder(dim=4096)
-        elif arch in ('vitq', 'vitq_s'):
-            self.enc = QueryLesionEncoder(dim=4096, size_token=arch == 'vitq_s')
+        elif arch.startswith('vitq'):
+            self.enc = QueryLesionEncoder(dim=4096, **vitq_options(arch))
         else:
             self.enc = PooledLesionEncoder(arch)
         self.size_head = nn.Sequential(nn.LayerNorm(4096), nn.Linear(4096, 1))
@@ -322,8 +422,12 @@ class Net(nn.Module):
         self.g = nn.Sequential(nn.Linear(1 + N_TYPES, 32), nn.GELU(), nn.Linear(32, 4))
 
     def forward(self, x, size_mm=None):
-        # vitq_s gets the mask size as an input (its size head is then a sanity check, not a result)
-        t = self.enc(x, size_mm) if getattr(self.enc, 'size_token', False) else self.enc(x)
+        # vitq_s* gets the mask size as an input (its size head is then a sanity check, not a result);
+        # x is a dict of views ('x', 'z') for vitq_*m / vitq_*z
+        if isinstance(x, dict):
+            t = self.enc(x['x'], size_mm, zoom=x.get('z'))
+        else:
+            t = self.enc(x, size_mm) if getattr(self.enc, 'size_token', False) else self.enc(x)
         if t.dim() == 3:          # vitq: one token per attribute query (QueryLesionEncoder.QUERY_NAMES)
             return self.size_head(t[:, 0])[:, 0], self.rads_head(t[:, 2]), self.type_head(t[:, 1]), t
         return self.size_head(t)[:, 0], self.rads_head(t), self.type_head(t), t
@@ -337,10 +441,17 @@ class Net(nn.Module):
 def load_mae_init(enc, path, arch):
     """Image path of the encoder from pretrain_lesion_mae.py; queries / decoder / fc stay random."""
     blob = torch.load(path, map_location='cpu', weights_only=False)
-    if blob.get('arch') != {'vitq_s': 'vitq'}.get(arch, arch):        # vitq_s = vitq + size input
+    if blob.get('arch') != ('vitq' if arch.startswith('vitq') else arch):    # vitq_* = vitq + options
         raise SystemExit(f'{path} is an arch={blob.get("arch")!r} encoder, not {arch!r}')
     pre = tuple(blob.get('pretrained_prefixes', ()))
     sd = {k: v for k, v in blob['encoder'].items() if pre and k.startswith(pre)}
+    own = enc.state_dict()
+    for k, v in list(sd.items()):
+        # mask channel (vitq_*m): the first conv gets a 2nd input channel; MAE weights go to the
+        # image channel and the mask channel starts at zero, so the initial output is the MAE one
+        if k in own and v.dim() == 5 and own[k].shape[1] != v.shape[1] and own[k].shape[0] == v.shape[0]:
+            w = torch.zeros_like(own[k]); w[:, :v.shape[1]] = v; sd[k] = w
+            print(f'[init] {k}: MAE {tuple(v.shape)} -> {tuple(w.shape)} (extra input channels start at 0)')
     missing, unexpected = enc.load_state_dict(sd, strict=False)
     if unexpected or not sd:
         raise SystemExit(f'{path}: {len(sd)} tensors to load, unexpected {unexpected[:5]}')
@@ -495,7 +606,7 @@ def evaluate(model, loader, device, tt=None, concept=False):
     P, L, T, C, Y, R, rows = [], [], [], [], [], [], []
     for x, logd, rads, row in loader:
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=device.type == 'cuda'):
-            s, r, t, _ = model(x.to(device), logd.to(device).exp())
+            s, r, t, _ = model(to_device(x, device), logd.to(device).exp())
         tp = F.softmax(t.float(), 1)
         P.append(s.float().cpu()); L.append(F.softmax(r.float(), 1).cpu()); T.append(tp.cpu())
         C.append(F.softmax(model.concept(s, tp), 1).cpu())
@@ -589,7 +700,8 @@ def fmt_type(m):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--arch', choices=['gap', 'center', 'attn', 'vitq', 'vitq_s'], required=True)
+    ap.add_argument('--arch', choices=['gap', 'center', 'attn', 'vitq', 'vitq_s', 'vitq_sm', 'vitq_sz', 'vitq_szm'],
+                    required=True, help='vitq_<flags>: s = mask size as input, m = nodule mask channel, z = zoom view')
     ap.add_argument('--data_root', default='/root/notebooks/groups/BME/reg2rg_nifti')
     ap.add_argument('--meta', default=None, help='nodule metadata csv (default <data_root>/nodule_metadata.csv; '
                     'split C: <data_root>/nodule_metadata_v2.csv)')
@@ -624,6 +736,8 @@ def main():
     tr = np.flatnonzero(meta['split'].to_numpy() == 'train')
     va = np.flatnonzero(meta['split'].to_numpy() == 'val')
     tt = TypeTargets(meta, a.type_csv, a.data_root, meta_csv)
+    if a.extra_train and a.arch.startswith('vitq') and (vitq_options(a.arch)['in_ch'] > 1 or vitq_options(a.arch)['zoom']):
+        raise SystemExit('--extra_train crops have no mask / zoom view; use vitq or vitq_s with it')
     if a.extra_train:
         if a.concept != 'none':
             raise SystemExit('--extra_train rows have no RADS label; use --concept none')
@@ -638,6 +752,7 @@ def main():
         tr = np.concatenate([tr, n0 + np.arange(len(ex))])
         tt.append_sets(ex['type_set'].tolist())
         print(f'[extra] {a.extra_train}: +{len(ex)} training crops; type sets {ex.type_set.value_counts().to_dict()}')
+    X = load_views(X, a.cache, a.arch, a.data_root, meta_csv)
     print(f'arch={a.arch}  type_loss={a.type_loss}  train={len(tr)}  val={len(va)}  val patients={meta.pid.iloc[va].nunique()}')
     print(f'[type] train: {int((tt.hard[tr] >= 0).sum())} hard, {int(((tt.tset[tr].sum(1) > 1)).sum())} partial, '
           f'{int((tt.bag[tr] >= 0).sum())} in {len(np.unique(tt.bag[tr][tt.bag[tr] >= 0]))} MIL bags; '
@@ -667,7 +782,7 @@ def main():
     for ep in range(a.epochs):
         model.train(); t0 = time.time(); tot = 0.0; parts = {}; nb = 0
         for x, ld, r, rows in dl_tr:
-            x, ld, r, rows = x.to(device), ld.to(device), r.to(device), rows.to(device)
+            x, ld, r, rows = to_device(x, device), ld.to(device), r.to(device), rows.to(device)
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=device.type == 'cuda'):
                 o = model(x, ld.exp())
             loss, p = obj(o, ld, r, rows, ep)

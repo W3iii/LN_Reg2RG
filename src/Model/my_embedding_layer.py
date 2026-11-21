@@ -206,10 +206,13 @@ class QueryLesionEncoder(nn.Module):
     QUERY_NAMES = ('size', 'type', 'rads')
 
     def __init__(self, dim=4096, width=32, d_model=256, depth=2, heads=8, dec_depth=2,
-                 n_queries=3, grid=(16, 16, 8), sigma=2.0, size_token=False):
+                 n_queries=3, grid=(16, 16, 8), sigma=2.0, size_token=False, in_ch=1, zoom=False):
         super().__init__()
         self.n_tokens = n_queries
-        self.net = nn.Sequential(_conv_block(1, width, 2), _conv_block(width, width * 2, 2),
+        # in_ch = 2: + the nodule's mask as a second input channel (vitq_*m); zoom: a second,
+        # size-normalised view (lesion_utils.lesion_views) through the same conv trunk (vitq_*z)
+        self.in_ch, self.zoom = in_ch, zoom
+        self.net = nn.Sequential(_conv_block(in_ch, width, 2), _conv_block(width, width * 2, 2),
                                  _conv_block(width * 2, width * 4, 1), _conv_block(width * 4, width * 4, 1))
         self.grid = tuple(grid)
         self.proj = nn.Linear(width * 4, d_model)
@@ -220,10 +223,19 @@ class QueryLesionEncoder(nn.Module):
         self.encoder = nn.TransformerEncoder(enc, depth, enable_nested_tensor=False) if depth else nn.Identity()
         self.mem_norm = nn.LayerNorm(d_model)
 
-        g = torch.stack(torch.meshgrid(*(torch.arange(float(n)) for n in grid), indexing='ij'))
-        centre = torch.tensor([(n - 1) / 2 for n in grid]).view(3, 1, 1, 1)
-        scale = torch.tensor([1., 1., 2.]).view(3, 1, 1, 1)          # z cells are 2x as thick
-        d2 = (((g - centre) * scale) ** 2).sum(0)
+        def centre_d2(gr, z_scale):
+            g = torch.stack(torch.meshgrid(*(torch.arange(float(n)) for n in gr), indexing='ij'))
+            centre = torch.tensor([(n - 1) / 2 for n in gr]).view(3, 1, 1, 1)
+            scale = torch.tensor([1., 1., z_scale]).view(3, 1, 1, 1)
+            return (((g - centre) * scale) ** 2).sum(0).flatten()
+        d2 = centre_d2(grid, 2.0)                                     # z cells are 2x as thick
+        if zoom:
+            # zoom view: 32x32x16 isotropic voxels -> 8x8x4 cells, its own position embedding;
+            # its cells join the memory after the native ones, with their own centre distances
+            self.zoom_grid = tuple(n // 2 for n in grid)
+            self.pos_zoom = nn.Parameter(torch.zeros(1, self.zoom_grid[0] * self.zoom_grid[1] * self.zoom_grid[2], d_model))
+            nn.init.trunc_normal_(self.pos_zoom, std=0.02)
+            d2 = torch.cat([d2, centre_d2(self.zoom_grid, 1.0)])
 
         self.queries = nn.Parameter(torch.zeros(1, n_queries, d_model))
         nn.init.trunc_normal_(self.queries, std=0.02)
@@ -242,12 +254,23 @@ class QueryLesionEncoder(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.fc = nn.Linear(d_model, dim)
 
-    def forward(self, x, size_mm=None):
-        # x: (N, 1, 64, 64, 32) -> (N, n_queries, dim); size_mm: (N,) mask eq. diameter, vitq_s only
+    def forward(self, x, size_mm=None, zoom=None):
+        # x: (N, in_ch, 64, 64, 32) -> (N, n_queries, dim); size_mm: (N,) mask eq. diameter (vitq_s*);
+        # zoom: (N, in_ch, 32, 32, 16) zoom view (vitq_*z)
+        if x.shape[1] != self.in_ch:
+            raise ValueError(f'lesion encoder expects {self.in_ch} input channel(s), got {x.shape[1]}'
+                             + ('' if self.in_ch == 1 else ' (crop + nodule mask; the report model does not pass the mask yet)'))
         f = self.net(x)                                     # (N, 4*width, 16, 16, 8)
         if tuple(f.shape[2:]) != self.grid:
             raise ValueError(f'feature grid {tuple(f.shape[2:])} != {self.grid}: crop size changed?')
         t = self.proj(f.flatten(2).transpose(1, 2)) + self.pos.to(f.dtype)
+        if self.zoom:
+            if zoom is None:
+                raise ValueError('this lesion encoder needs the zoom view (lesion_utils.lesion_views)')
+            fz = self.net(zoom)
+            if tuple(fz.shape[2:]) != self.zoom_grid:
+                raise ValueError(f'zoom grid {tuple(fz.shape[2:])} != {self.zoom_grid}')
+            t = torch.cat([t, self.proj(fz.flatten(2).transpose(1, 2)) + self.pos_zoom.to(f.dtype)], 1)
         mem = self.mem_norm(self.encoder(t))
         q = self.queries.to(mem.dtype).expand(x.shape[0], -1, -1)
         if self.size_token:
@@ -266,14 +289,25 @@ class QueryLesionEncoder(nn.Module):
 
 
 SIZE_LOG_CENTRE, SIZE_LOG_SCALE = 1.7, 0.5     # log(eq_diam_mm): median ~5.5 mm, most 3-15 mm
-LESION_ARCHS = ('gap', 'center', 'attn', 'vitq', 'vitq_s')
+LESION_ARCHS = ('gap', 'center', 'attn', 'vitq', 'vitq_s', 'vitq_sm', 'vitq_sz', 'vitq_szm')
+
+
+def vitq_options(arch):
+    """QueryLesionEncoder kwargs of a vitq arch name: vitq[_<flags>], s = size token,
+    m = nodule mask as a 2nd channel, z = zoom view."""
+    if arch != 'vitq' and not arch.startswith('vitq_'):
+        raise ValueError(f'{arch!r} is not a vitq arch')
+    flags = arch[5:] if arch.startswith('vitq_') else ''
+    if set(flags) - set('smz'):
+        raise ValueError(f'unknown vitq flags in {arch!r}')
+    return dict(size_token='s' in flags, in_ch=2 if 'm' in flags else 1, zoom='z' in flags)
 
 
 def build_lesion_encoder(arch='gap', dim=4096):
     if arch == 'gap':
         return LesionEncoder(dim=dim)
-    if arch in ('vitq', 'vitq_s'):
-        return QueryLesionEncoder(dim=dim, size_token=arch == 'vitq_s')
+    if arch.startswith('vitq'):
+        return QueryLesionEncoder(dim=dim, **vitq_options(arch))
     return PooledLesionEncoder(arch, dim=dim)
 
 

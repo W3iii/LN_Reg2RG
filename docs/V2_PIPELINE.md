@@ -188,3 +188,19 @@ supervised crops, `--extra_train`, gave nothing: rho 0.802 / kappa 0.709 / type 
 Compare seeds 0-2 with and without INIT on ME val (157 patients, part-solid n = 1, so one seed
 is not enough). Only if MAE wins: point `lesion_encoder_ckpt` of the report model at it,
 re-run predict_types_v2.py and retrain the LLM.
+
+### Views for type (2026-11-21): nodule mask channel, zoom view
+
+MAE x size ablation (project doc lesion-encoder-mae-size-ablation): size input lifts RADS kappa
+0.70 -> 0.77, type bacc stays ~0.47-0.50 in every arm. 80% of ME nodules are <= 6 mm = 1-2 cells
+of the 16x16x8 grid, so the density that separates GGO / solid is mostly gone after the trunk.
+`lesion_utils.lesion_views` adds, per nodule:
+- mask channel (`m`): instance mask == nodule_id in the same 64x64x32 window (box for the 10
+  doc_bbox nodules), stacked as input channel 2 -- the encoder knows which voxels are the nodule
+- zoom view (`z`): isotropic window of max(3 x eq. diameter, 16 mm), resampled to 32x32x16
+  (a 4 mm nodule spans ~8 of 32 px), through the same conv trunk -> 8x8x4 cells with their own
+  position embedding, appended to the grid memory (2048 + 256 tokens)
+Arch names `vitq_<flags>`: s size input, m mask channel, z zoom view (vitq_s, vitq_sm, vitq_sz,
+vitq_szm). MAE weights load as before; the first conv's mask channel starts at 0. Views are cached
+next to the crop cache (`*_mask.npy`, `*_zoom.npy`, `*_zoommask.npy`, ~0.8 GB, built on first use).
+The report model does not pass masks / zoom views yet and refuses these arches.
